@@ -80,8 +80,6 @@ Open the URL Streamlit prints (default `http://localhost:8501`).
 3. Type a question and click **Ask**. The answer streams in, with the source
    excerpts shown in the **Sources used** expander.
 
-Sample documents are included under `sample_docs/` to try it out.
-
 ## Privacy & security
 
 - 🔑 API keys live only in `st.session_state` for the browser session — not on
