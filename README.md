@@ -97,3 +97,8 @@ Sample documents are included under `sample_docs/` to try it out.
 
 Copy `.env.example` to `.env` to override defaults (e.g. `OLLAMA_HOST`).
 Environment-variable keys are optional — the in-app key box is the primary path.
+
+## Original design notes
+
+The initial design write-up and the original prototype (`JJrag.py`) are kept in
+[`DESIGN_NOTES.md`](DESIGN_NOTES.md) and `JJrag.py`.
