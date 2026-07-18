@@ -1,0 +1,20 @@
+# Core app
+streamlit>=1.30
+requests>=2.31
+
+# RAG pipeline
+langchain>=0.1
+langchain-community>=0.0.20
+faiss-cpu>=1.7
+sentence-transformers>=2.2
+
+# Document loaders
+pypdf>=4.0
+docx2txt>=0.8
+
+# Cloud generation backends (Accuracy mode) — optional at runtime
+anthropic>=0.40
+openai>=1.30
+
+# Local generation (Privacy mode) is served by Ollama (https://ollama.com),
+# installed separately as a system binary — not a Python package.
