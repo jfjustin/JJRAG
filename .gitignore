@@ -4,6 +4,10 @@ key.env
 *.key
 secrets.*
 
+# EMQuantAPI credentials + runtime logs — never commit
+emquant/credentials.ini
+EmQuantAPI*.log
+
 # Runtime artifacts
 rag_app.log
 temp_docs/
