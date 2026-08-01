@@ -214,11 +214,18 @@ def stream_anthropic_answer(question, docs, api_key, model="claude-opus-4-8"):
             yield text
 
 
-def stream_openai_answer(question, docs, api_key, model="gpt-4o"):
-    """Stream an answer from an OpenAI model. Key stays in memory only."""
+def stream_openai_answer(question, docs, api_key, model="gpt-4o", base_url=None):
+    """Stream an answer from any OpenAI-compatible endpoint. Key stays in memory only.
+
+    ``base_url`` lets you point at a self-hosted, OpenAI-compatible server instead
+    of api.openai.com — for example a vLLM instance serving **Kimi** on an AMD
+    Instinct GPU in AMD Developer Cloud (``http://<droplet-ip>:8000/v1``). When it
+    is ``None`` the client talks to OpenAI as usual. See the README section
+    "Running Kimi on AMD Developer Cloud" for the full setup.
+    """
     from openai import OpenAI
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url=base_url or None)
     prompt = _build_prompt(question, docs)
     stream = client.chat.completions.create(
         model=model,
@@ -260,6 +267,7 @@ def main():
         provider = None
         model_name = None
         api_key = None
+        base_url = None
 
         if is_private:
             st.markdown(
@@ -276,7 +284,12 @@ def main():
                 )
         else:
             provider = st.selectbox(
-                "Provider", ("Anthropic (Claude)", "OpenAI (GPT)")
+                "Provider",
+                (
+                    "Anthropic (Claude)",
+                    "OpenAI (GPT)",
+                    "Kimi on AMD Developer Cloud (OpenAI-compatible)",
+                ),
             )
             # The private-key slot. type="password" masks it; it is stored ONLY
             # in st.session_state for this browser session and is never written
@@ -286,7 +299,9 @@ def main():
                 type="password",
                 help=(
                     "Held in session memory only — never saved to disk, never "
-                    "logged, never sent anywhere except the provider you chose."
+                    "logged, never sent anywhere except the provider you chose. "
+                    "For a self-hosted vLLM endpoint, use whatever token you "
+                    "launched the server with (or any placeholder if it has none)."
                 ),
                 value=st.session_state.get("api_key", ""),
             )
@@ -297,7 +312,24 @@ def main():
                     "Model",
                     ("claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"),
                 )
+            elif provider.startswith("Kimi"):
+                # Self-hosted, OpenAI-compatible endpoint (e.g. vLLM serving Kimi
+                # on an AMD Instinct GPU in AMD Developer Cloud). Point base_url
+                # at that server; the OpenAI backend handles the rest.
+                base_url = st.text_input(
+                    "Endpoint base URL",
+                    value=os.getenv("OPENAI_BASE_URL", ""),
+                    placeholder="http://<your-amd-droplet-ip>:8000/v1",
+                    help=(
+                        "Your vLLM OpenAI-compatible URL — see the README section "
+                        "'Running Kimi on AMD Developer Cloud'."
+                    ),
+                )
+                model_name = st.text_input(
+                    "Model", value="moonshotai/Kimi-K2-Instruct"
+                )
             else:
+                base_url = os.getenv("OPENAI_BASE_URL") or None
                 model_name = st.text_input("Model", value="gpt-4o")
 
         st.divider()
@@ -332,11 +364,15 @@ def main():
     query = st.text_input("Ask a question about your documents")
 
     if st.button("💬 Ask") and query:
+        is_self_hosted = provider is not None and provider.startswith("Kimi")
         if st.session_state.vector_store is None:
             st.warning("Process some documents first.")
             return
-        if not is_private and not api_key:
+        if not is_private and not api_key and not is_self_hosted:
             st.warning("Enter your API key in the sidebar to use Accuracy mode.")
+            return
+        if is_self_hosted and not base_url:
+            st.warning("Enter your endpoint base URL in the sidebar.")
             return
         if is_private and not model_name:
             st.warning("No local model available — see the sidebar.")
@@ -351,7 +387,11 @@ def main():
             elif provider.startswith("Anthropic"):
                 gen = stream_anthropic_answer(query, docs, api_key, model_name)
             else:
-                gen = stream_openai_answer(query, docs, api_key, model_name)
+                # OpenAI (GPT) and Kimi-on-AMD share the OpenAI-compatible path.
+                # Self-hosted vLLM often needs no real key — send a placeholder.
+                gen = stream_openai_answer(
+                    query, docs, api_key or "EMPTY", model_name, base_url=base_url
+                )
             st.write_stream(gen)
         except Exception as e:  # noqa: BLE001
             # Never echo the API key, even on error.
