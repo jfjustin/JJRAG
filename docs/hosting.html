@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hosting — JJRAG</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+</head>
+<body>
+<header class="site">
+  <strong>🔒 JJRAG</strong>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="pipeline.html">Pipeline</a>
+    <a href="hosting.html" class="active">Hosting</a>
+    <a href="compliance.html">Compliance</a>
+    <a href="https://github.com/jfjustin/JJRAG">GitHub</a>
+  </nav>
+</header>
+
+<main>
+<h1>Hosting on your own domain</h1>
+<p class="lead">
+  Two separate things can be published, and they have different requirements.
+  Getting this distinction right is most of the work.
+</p>
+
+<table>
+  <tr><th>What</th><th>Where it can live</th><th>Why</th></tr>
+  <tr>
+    <td><strong>These docs</strong> (static HTML)</td>
+    <td>GitHub Pages, behind Cloudflare or a GoDaddy CNAME</td>
+    <td>Public, static, no data. A CDN is exactly right.</td>
+  </tr>
+  <tr>
+    <td><strong>The app</strong> (uploads, index, model)</td>
+    <td>A machine you control, published via Cloudflare Tunnel or a VPS</td>
+    <td>It holds your documents and runs the model. GitHub Pages cannot host
+        it — Pages serves static files only, and putting documents on a CDN
+        would defeat the entire point.</td>
+  </tr>
+</table>
+
+<blockquote class="warn">
+  <strong>Do not commit <code>data/</code>.</strong> It holds uploaded
+  documents, the index, and the catalog. It is gitignored — keep it that way.
+  Publishing your documents to a public repository is the exact outcome this
+  project exists to prevent.
+</blockquote>
+
+<h2>Part 1 — Publish the docs on GitHub Pages</h2>
+<p>
+  The workflow at <code>.github/workflows/pages.yml</code> deploys the
+  <code>docs/</code> directory on every push to <code>main</code>. Enable it
+  once:
+</p>
+<ol>
+  <li>Repository → <strong>Settings → Pages</strong>.</li>
+  <li><strong>Source</strong> → <em>GitHub Actions</em>.</li>
+  <li>Push to <code>main</code>. The site appears at
+      <code>https://&lt;user&gt;.github.io/JJRAG/</code>.</li>
+</ol>
+
+<h3>Point your own domain at it — Cloudflare</h3>
+<p>If your domain's nameservers are at Cloudflare:</p>
+<ol>
+  <li>Cloudflare dashboard → your domain → <strong>DNS → Records</strong>.</li>
+  <li>Add a <code>CNAME</code>: name <code>docs</code>, target
+      <code>&lt;user&gt;.github.io</code>, proxy status
+      <strong>DNS only</strong> (grey cloud) for the initial certificate
+      issuance. You may turn the orange cloud back on once GitHub reports the
+      certificate as issued.</li>
+  <li>Back in GitHub → Settings → Pages → <strong>Custom domain</strong>, enter
+      <code>docs.example.com</code> and save. This writes a
+      <code>CNAME</code> file into the published site.</li>
+  <li>Tick <strong>Enforce HTTPS</strong> once the certificate is issued
+      (usually minutes; occasionally up to an hour).</li>
+</ol>
+
+<h3>Point your own domain at it — GoDaddy</h3>
+<p>If your domain stays on GoDaddy's nameservers:</p>
+<ol>
+  <li>GoDaddy → <strong>My Products → Domain → DNS → Manage Zones</strong>.</li>
+  <li>Add a <code>CNAME</code>: <strong>Name</strong> <code>docs</code>,
+      <strong>Value</strong> <code>&lt;user&gt;.github.io</code>, TTL 1 hour.</li>
+  <li>For the apex domain (<code>example.com</code> with no subdomain), GoDaddy
+      does not support CNAME at the root — add four <code>A</code> records
+      instead, pointing at GitHub's Pages addresses:
+      <code>185.199.108.153</code>, <code>185.199.109.153</code>,
+      <code>185.199.110.153</code>, <code>185.199.111.153</code>.</li>
+  <li>Set the same custom domain in GitHub → Settings → Pages, then enable
+      <strong>Enforce HTTPS</strong>.</li>
+</ol>
+<p>Verify propagation before assuming something is broken:</p>
+<pre><code>dig +short docs.example.com CNAME
+curl -sI https://docs.example.com | head -n 1</code></pre>
+
+<h2>Part 2 — Publish the app</h2>
+
+<h3>Option A — Cloudflare Tunnel <em>(recommended)</em></h3>
+<p>
+  This is the best fit for a local-model system. Your machine keeps the
+  documents and the model, opens only an <strong>outbound</strong> connection to
+  Cloudflare, and serves a public hostname over HTTPS. No inbound firewall rule,
+  no public IP, no port forwarding — so this works from an office box or a home
+  server that has no business being directly reachable.
+</p>
+<ol>
+  <li>Cloudflare <strong>Zero Trust</strong> dashboard →
+      <strong>Networks → Tunnels → Create a tunnel</strong> → name it
+      <code>jjrag</code> → copy the token.</li>
+  <li>Put the token and an API token in <code>deploy/.env</code>
+      (copy <code>deploy/.env.example</code>):
+<pre><code>JJRAG_API_TOKEN=$(openssl rand -hex 32)
+CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoi...</code></pre></li>
+  <li>Start the stack with the tunnel profile:
+<pre><code>docker compose -f deploy/docker-compose.yml --profile tunnel up -d
+docker compose -f deploy/docker-compose.yml exec ollama ollama pull llama3.1:8b</code></pre></li>
+  <li>In the tunnel's <strong>Public Hostname</strong> tab, route
+      <code>app.example.com</code> → <code>http://app:8000</code>.</li>
+</ol>
+<p>
+  Then put <strong>Cloudflare Access</strong> in front of it (Zero Trust →
+  Access → Applications). That gives you SSO, per-user policies and a login
+  audit trail without writing any auth code — and it means the app is not
+  exposed to the open internet even though it has a public hostname.
+</p>
+
+<h3>Option B — Your own VPS</h3>
+<p>
+  Use this when the domain's <code>A</code> record points at a server you
+  control — a GoDaddy-registered domain aimed at a VPS, for instance. The app
+  binds to loopback and nginx terminates TLS in front of it.
+</p>
+<ol>
+  <li>DNS: an <code>A</code> record for <code>app</code> → your server's IP
+      (at Cloudflare or GoDaddy, whichever holds the zone).</li>
+  <li>Deploy the stack, then install the reverse proxy config:
+<pre><code>sudo cp deploy/nginx.conf /etc/nginx/sites-available/jjrag
+sudo ln -s /etc/nginx/sites-available/jjrag /etc/nginx/sites-enabled/
+sudo certbot --nginx -d app.example.com
+sudo nginx -t &amp;&amp; sudo systemctl reload nginx</code></pre></li>
+  <li>Confirm the app itself is <em>not</em> reachable except through nginx:
+      <code>ss -tlnp | grep 8000</code> should show <code>127.0.0.1:8000</code>.</li>
+</ol>
+<p>
+  <code>deploy/nginx.conf</code> already sets the two things people usually get
+  wrong: <code>proxy_buffering off</code> on <code>/api/query/stream</code> (or
+  streamed answers arrive all at once at the end) and a
+  <code>client_max_body_size</code> matching your upload cap.
+</p>
+
+<h3>Option C — Bare metal, no Docker</h3>
+<pre><code>sudo cp deploy/jjrag.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now jjrag</code></pre>
+
+<h2>Before you expose it publicly</h2>
+<ul>
+  <li><strong>Set an API token.</strong> <code>security.api_token</code>, or
+      <code>JJRAG_API_TOKEN</code>. Without it, uploads and deletions are
+      unauthenticated. <code>jjrag doctor</code> fails when
+      <code>environment: prod</code> and no token is set.</li>
+  <li><strong>Decide about anonymous reads.</strong>
+      <code>allow_anonymous_read: false</code> requires the token for querying
+      too.</li>
+  <li><strong>Put an identity layer in front</strong> — Cloudflare Access, or
+      your own SSO proxy. The bearer token is a shared secret, not user
+      management.</li>
+  <li><strong>Keep <code>trusted_proxy_header</code> honest.</strong> It is set
+      to <code>cf-connecting-ip</code> for Cloudflare. Behind plain nginx use
+      <code>x-real-ip</code>; with no proxy at all, set it to
+      <code>null</code>, or clients can forge it and defeat rate limiting.</li>
+  <li><strong>Back up <code>data/</code>.</strong> The catalog and index are
+      rebuildable from the originals; the originals are not rebuildable from
+      anything.</li>
+  <li><strong>Set a retention policy</strong> if your obligations require one:
+      <code>security.retention_days</code>.</li>
+</ul>
+
+<h2>Sizing the model to the machine</h2>
+<table>
+  <tr><th>Host</th><th>Model</th><th>Expect</th></tr>
+  <tr><td>8 GB RAM, CPU only</td><td><code>llama3.2:3b</code> or <code>phi3:mini</code></td><td>~5–15 s per answer</td></tr>
+  <tr><td>16 GB RAM, CPU only</td><td><code>llama3.1:8b</code></td><td>~15–40 s per answer</td></tr>
+  <tr><td>NVIDIA GPU, 8 GB+ VRAM</td><td><code>llama3.1:8b</code></td><td>~1–3 s per answer</td></tr>
+  <tr><td>NVIDIA GPU, 24 GB+ VRAM</td><td><code>qwen2.5:14b</code>, <code>llama3.1:70b</code> quantised</td><td>Best quality</td></tr>
+</table>
+<p>
+  Indexing is unaffected by the generation model — embeddings are small and run
+  on CPU comfortably. If answers are too slow, change the generation model
+  first; there is no need to re-index, because the index does not depend on it.
+</p>
+</main>
+
+<footer>JJRAG — local-only document Q&amp;A.</footer>
+</body>
+</html>

@@ -1,18 +1,43 @@
-# Secrets — never commit API keys
-.env
-key.env
-*.key
-secrets.*
-
-# Runtime artifacts
-rag_app.log
+# ── Data: uploaded documents, index, catalog, logs ────────────────────────
+# NEVER commit this. It contains the documents this project exists to protect.
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 temp_docs/
 vector_cache/
+
+# ── Secrets ───────────────────────────────────────────────────────────────
+.env
+deploy/.env
+key.env
+*.key
+*.pem
+secrets.*
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log
+rag_app.log
+
+# ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+build/
+dist/
 .venv/
 venv/
-.DS_Store
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
 
-# Model / HF caches
+# ── Model / HF caches ─────────────────────────────────────────────────────
 .cache/
+models/
+
+# ── OS / editors ──────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/

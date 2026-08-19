@@ -1,20 +1,32 @@
-# Core app
-streamlit>=1.30
+# Runtime dependencies for JJRAG.
+#
+# There is no hosted-model SDK in this file — no `anthropic`, no `openai`, no
+# cloud embedding client — because the pipeline has no code path that would
+# call one. Generation and embeddings both run locally.
+#
+#   pip install -r requirements.txt          # core + local embeddings
+#   pip install -e .                         # same, as an editable package
+
+# Core
+numpy>=1.24
+pydantic>=2.5
+pydantic-settings>=2.1
+PyYAML>=6.0
 requests>=2.31
 
-# RAG pipeline
-langchain>=0.1
-langchain-community>=0.0.20
-faiss-cpu>=1.7
-sentence-transformers>=2.2
+# Web app
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
 
-# Document loaders
+# Document extraction
 pypdf>=4.0
-docx2txt>=0.8
+# DOCX and PPTX are parsed with the standard library (zipfile + ElementTree).
 
-# Cloud generation backends (Accuracy mode) — optional at runtime
-anthropic>=0.40
-openai>=1.30
+# Local embeddings (default backend). Drop these two lines and set
+# embedding.backend to "ollama" or "hashing" for a weight-free install.
+sentence-transformers>=2.6
+torch>=2.0
 
-# Local generation (Privacy mode) is served by Ollama (https://ollama.com),
-# installed separately as a system binary — not a Python package.
+# Local generation is served by Ollama (https://ollama.com), installed as a
+# system binary rather than a Python package.

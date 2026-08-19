@@ -1,0 +1,27 @@
+# Cloudflare Tunnel configuration, for the `cloudflared` binary run directly on
+# a host (the docker-compose `tunnel` profile uses a token instead and needs no
+# file).
+#
+# Why a tunnel is the right fit here: your machine keeps the documents and the
+# model, makes only an *outbound* connection to Cloudflare, and serves a public
+# hostname. No inbound firewall rule, no public IP, no port forwarding — which
+# is what makes it viable to run this from an office box or a home lab and
+# still have https://docs.example.com work.
+#
+#   cloudflared tunnel login
+#   cloudflared tunnel create jjrag
+#   cloudflared tunnel route dns jjrag docs.example.com
+#   cloudflared tunnel --config deploy/cloudflared-config.yml run jjrag
+
+tunnel: jjrag
+credentials-file: /etc/cloudflared/jjrag.json
+
+ingress:
+  - hostname: docs.example.com
+    service: http://localhost:8000
+    originRequest:
+      connectTimeout: 30s
+      # Local generation on CPU can take a while; don't cut the stream off.
+      noTLSVerify: false
+      disableChunkedEncoding: false
+  - service: http_status:404

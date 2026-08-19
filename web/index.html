@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>JJRAG — Private Document Q&amp;A</title>
+<link rel="stylesheet" href="/assets/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="lock" aria-hidden="true">🔒</span>
+    <div>
+      <h1>JJRAG</h1>
+      <p class="tagline">Document Q&amp;A that never leaves this machine</p>
+    </div>
+  </div>
+  <div class="status" id="status-strip">
+    <span class="pill" id="pill-model" title="Local generation model">model: …</span>
+    <span class="pill" id="pill-index" title="Published index version">index: …</span>
+    <span class="pill pill-good" id="pill-privacy" title="Egress policy">local-only</span>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab active" role="tab" data-panel="ask">Ask</button>
+  <button class="tab" role="tab" data-panel="documents">Documents</button>
+  <button class="tab" role="tab" data-panel="pipeline">Pipeline</button>
+  <button class="tab" role="tab" data-panel="compliance">Compliance</button>
+</nav>
+
+<main>
+  <!-- ─────────────── Ask ─────────────── -->
+  <section class="panel active" id="panel-ask" role="tabpanel">
+    <form id="ask-form" class="ask-form">
+      <label class="visually-hidden" for="question">Your question</label>
+      <textarea id="question" rows="3" placeholder="Ask something answerable from your documents — e.g. “What is the retention period for customer records?”" required></textarea>
+      <div class="ask-controls">
+        <label>Passages
+          <input type="number" id="top-k" min="1" max="20" value="5">
+        </label>
+        <button type="submit" class="primary" id="ask-button">Ask</button>
+      </div>
+    </form>
+
+    <div id="answer-card" class="card hidden">
+      <div class="card-head">
+        <h2>Answer</h2>
+        <span class="meta" id="answer-meta"></span>
+      </div>
+      <div id="answer-text" class="answer"></div>
+    </div>
+
+    <div id="sources-card" class="card hidden">
+      <div class="card-head">
+        <h2>Sources used</h2>
+        <span class="meta">Every claim above should trace to one of these</span>
+      </div>
+      <div id="sources-list"></div>
+    </div>
+  </section>
+
+  <!-- ─────────────── Documents ─────────────── -->
+  <section class="panel" id="panel-documents" role="tabpanel">
+    <div class="card">
+      <div class="card-head"><h2>Add documents</h2></div>
+      <div id="dropzone" class="dropzone" tabindex="0" role="button"
+           aria-label="Choose files to upload">
+        <p><strong>Drop files here</strong> or click to choose</p>
+        <p class="hint">PDF · DOCX · PPTX · TXT · MD · HTML · CSV · JSON · EML</p>
+        <input type="file" id="file-input" multiple hidden
+               accept=".pdf,.docx,.pptx,.txt,.md,.markdown,.html,.htm,.csv,.tsv,.json,.jsonl,.eml">
+      </div>
+      <ul id="upload-list" class="upload-list"></ul>
+      <div class="row">
+        <button class="primary" id="ingest-button" disabled>Process documents</button>
+        <label class="checkbox">
+          <input type="checkbox" id="force-reingest"> Re-process files already indexed
+        </label>
+      </div>
+      <div id="ingest-progress" class="progress hidden"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Indexed documents</h2>
+        <button class="ghost" id="refresh-documents">Refresh</button>
+      </div>
+      <div id="documents-list" class="documents"></div>
+    </div>
+  </section>
+
+  <!-- ─────────────── Pipeline ─────────────── -->
+  <section class="panel" id="panel-pipeline" role="tabpanel">
+    <div class="card">
+      <div class="card-head">
+        <h2>Latest run</h2>
+        <button class="ghost" id="refresh-runs">Refresh</button>
+      </div>
+      <div id="run-detail" class="run-detail">
+        <p class="hint">No runs yet. Upload documents and press “Process documents”.</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Run history</h2></div>
+      <div id="runs-list"></div>
+    </div>
+  </section>
+
+  <!-- ─────────────── Compliance ─────────────── -->
+  <section class="panel" id="panel-compliance" role="tabpanel">
+    <div class="card">
+      <div class="card-head">
+        <h2>Privacy posture</h2>
+        <span class="meta">Live values from the running service</span>
+      </div>
+      <div id="compliance-body"><p class="hint">Loading…</p></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+<script src="/assets/app.js"></script>
+</body>
+</html>

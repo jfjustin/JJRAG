@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pipeline reference — JJRAG</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+</head>
+<body>
+<header class="site">
+  <strong>🔒 JJRAG</strong>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="pipeline.html" class="active">Pipeline</a>
+    <a href="hosting.html">Hosting</a>
+    <a href="compliance.html">Compliance</a>
+    <a href="https://github.com/jfjustin/JJRAG">GitHub</a>
+  </nav>
+</header>
+
+<main>
+<h1>Pipeline reference</h1>
+<p class="lead">
+  Eight stages, each with typed inputs and outputs, each gated. A run either
+  publishes a validated index or fails with a named rule and changes nothing.
+</p>
+
+<div class="pipeline">
+  <span>scan</span><span>extract</span><span>transform</span><span>assemble</span>
+  <span>embed</span><span>load</span><span>publish</span>
+</div>
+
+<h2>1 · Scan — admission control</h2>
+<p>
+  Uploads are untrusted input. Before a file is opened by a parser it must pass:
+  an extension allowlist, a magic-byte check that the content matches the
+  extension, a size cap, a zip-bomb expansion-ratio check for OOXML containers,
+  and a macro-payload check. Rejected files move to
+  <code>data/quarantine/</code> with a <code>.reason.txt</code> beside them —
+  never silently dropped, because an auditor needs to see what was refused.
+</p>
+<p>
+  Files whose SHA-256 is already in the catalog are skipped, which makes
+  re-running ingestion on a directory idempotent and cheap.
+</p>
+
+<h2>2 · Extract — bytes to text, with provenance</h2>
+<p>
+  One extractor per format, all producing the same record shape. Extraction is
+  <em>segment-aware</em>: a PDF page, a slide, a CSV row-group and an email body
+  each become a segment with a human-readable label. That label is what a
+  citation shows the reader — <code>report.pdf, p. 12</code> — and it is the
+  difference between an answer you can check and one you have to trust.
+</p>
+<table>
+  <tr><th>Format</th><th>Segmentation</th><th>Notes</th></tr>
+  <tr><td><code>.pdf</code></td><td>one per page</td><td>Flags pages with no text as likely scans; optional local OCR fallback.</td></tr>
+  <tr><td><code>.docx</code></td><td>whole document</td><td>Headings and tables preserved; parsed with the standard library.</td></tr>
+  <tr><td><code>.pptx</code></td><td>one per slide</td><td>Includes speaker notes.</td></tr>
+  <tr><td><code>.md</code></td><td>one per heading</td><td>Section structure survives into chunk metadata.</td></tr>
+  <tr><td><code>.html</code></td><td>whole document</td><td>Scripts and styles stripped before text.</td></tr>
+  <tr><td><code>.csv</code> / <code>.tsv</code></td><td>50-row groups</td><td>Column names repeated per row so chunks stay self-describing.</td></tr>
+  <tr><td><code>.json</code> / <code>.jsonl</code></td><td>one per record</td><td>Nested structures flattened to <code>path: value</code> lines.</td></tr>
+  <tr><td><code>.eml</code></td><td>whole message</td><td>Headers kept as context above the body.</td></tr>
+</table>
+<p>A parser failure on one file never aborts the run; it is recorded and surfaced by the validation stage.</p>
+
+<h2>3 · Transform — clean, redact, chunk</h2>
+<p>Most retrieval quality is won or lost here, in this order:</p>
+<ol>
+  <li><strong>Normalise</strong> — Unicode NFKC, ligatures, smart quotes,
+      control characters, whitespace. Two spellings of one word must not become
+      two vectors.</li>
+  <li><strong>De-hyphenate</strong> — PDFs break words across lines
+      (<code>compli-\nance</code>); rejoining them is the single highest-value
+      cleanup for PDF corpora.</li>
+  <li><strong>Strip boilerplate</strong> — lines repeating on most pages are
+      headers and footers, and they otherwise crowd real content out of the
+      top-k.</li>
+  <li><strong>Redact PII</strong> — before anything is persisted, with typed
+      placeholders that keep sentences readable and co-reference intact.</li>
+  <li><strong>Chunk</strong> — recursively on natural boundaries (paragraph,
+      then sentence, then word), with overlap so an answer spanning a boundary
+      stays retrievable.</li>
+  <li><strong>Deduplicate</strong> — exact by hash, near-duplicate by token
+      shingle overlap, across the whole corpus.</li>
+</ol>
+<blockquote>
+  The original prototype used a 1,000-character chunk with 150 of overlap; those
+  remain the defaults. Chunks can exceed <code>chunk_size</code> by up to
+  <code>chunk_overlap</code>, which the <code>max_chunk_chars</code> gate
+  accounts for.
+</blockquote>
+
+<h2>4 · Validate — the gates</h2>
+<p>
+  A RAG system fails quietly: nobody sees a broken pipeline, they just get worse
+  answers. Validation runs at every stage boundary and makes failure loud. Any
+  <span class="bad">error</span>-severity finding fails the run by default
+  (<code>validation.max_error_issues: 0</code>).
+</p>
+<table>
+  <tr><th>Stage</th><th>Rule</th><th>Catches</th></tr>
+  <tr><td>extract</td><td><code>empty_text</code></td><td>Scanned PDFs and files that parsed to nothing.</td></tr>
+  <tr><td>extract</td><td><code>garbled_text</code></td><td>Binary noise from a mis-detected format.</td></tr>
+  <tr><td>extract</td><td><code>low_yield</code></td><td>A batch where most files produced no text.</td></tr>
+  <tr><td>extract</td><td><code>failed</code></td><td>Password-protected or corrupt documents.</td></tr>
+  <tr><td>transform</td><td><code>no_chunks</code></td><td>A document that vanished during cleaning.</td></tr>
+  <tr><td>transform</td><td><code>chunk_too_long</code></td><td>Chunks that will not fit the embedding context.</td></tr>
+  <tr><td>transform</td><td><code>low_alpha_ratio</code></td><td>Tables, number dumps and OCR noise.</td></tr>
+  <tr><td>transform</td><td><code>residual_pii</code></td><td>Identifiers that survived redaction.</td></tr>
+  <tr><td>embed</td><td><code>zero_vector</code></td><td>Chunks that could never be retrieved.</td></tr>
+  <tr><td>embed</td><td><code>non_finite</code></td><td>NaN/infinity from a broken model load.</td></tr>
+  <tr><td>embed</td><td><code>unexpected_dimensions</code></td><td>A changed embedding model — the classic silent corruption.</td></tr>
+  <tr><td>load</td><td><code>index_parity</code></td><td>Vector count not matching chunk count.</td></tr>
+  <tr><td>load</td><td><code>catalog_drift</code></td><td>Index and catalog disagreeing about the corpus.</td></tr>
+  <tr><td>load</td><td><code>empty_index</code></td><td>Publishing an index that can answer nothing.</td></tr>
+</table>
+
+<h2>5 · Assemble — why every run is a full rebuild</h2>
+<p>
+  Each run re-indexes every active document, not only the new files. That is
+  what keeps deletions, retention sweeps and configuration changes actually
+  reflected in what gets searched, and it makes index/catalog drift structurally
+  impossible. Because embeddings are cached by <code>(model, text hash)</code>,
+  the repeated work costs almost nothing — a re-run of an unchanged corpus is a
+  100% cache hit.
+</p>
+
+<h2>6 · Embed — local backends</h2>
+<table>
+  <tr><th>Backend</th><th>Use when</th></tr>
+  <tr><td><code>sentence-transformers</code></td><td>Default. Weights downloaded once at install, then fully offline.</td></tr>
+  <tr><td><code>ollama</code></td><td>You want one model runtime for both embedding and generation.</td></tr>
+  <tr><td><code>hashing</code></td><td>CI, smoke tests, or air-gapped hosts that cannot fetch weights at all. Deterministic and dependency-free; keyword retrieval still works.</td></tr>
+</table>
+
+<h2>7 · Load and publish — atomic versions</h2>
+<p>
+  A run writes <code>data/index/v7/</code> beside the live <code>v6/</code> and
+  only rewrites the <code>current</code> pointer once every gate has passed —
+  and the pointer write is an atomic rename. So a failed run leaves the previous
+  index serving traffic untouched, and rollback is a pointer move:
+</p>
+<pre><code># roll back to the previous published version
+python -c "from jjrag.config import get_settings; \
+from jjrag.store.vectorstore import VectorStore; \
+s=get_settings(); \
+print(VectorStore(s.paths.index_dir).rollback())"</code></pre>
+
+<h2>Retrieval</h2>
+<p>
+  Dense-only search misses exact terms — an invoice number, a policy code like
+  <code>DR-14</code>, a surname. Keyword-only search misses paraphrase. JJRAG
+  runs both and fuses them with Reciprocal Rank Fusion, which needs no score
+  calibration between two very different scales. MMR then trims the candidates
+  to <code>top_k</code>, trading a little relevance for diversity so the context
+  window is not three near-identical paragraphs from one page.
+</p>
+
+<h2>Operating it</h2>
+<pre><code>jjrag doctor                     # environment check
+jjrag ingest ~/docs              # run the pipeline
+jjrag ingest --force ~/docs      # re-ingest already-indexed files
+jjrag rebuild                    # re-index after a config change
+jjrag runs                       # run history
+jjrag runs run_abc123            # full validation report as JSON
+jjrag docs                       # indexed documents
+jjrag rm doc_abc123              # erase a document and rebuild
+jjrag query "..." --retrieve-only  # inspect retrieval without generating
+jjrag serve                      # web app</code></pre>
+<p>
+  Everything above is also available over HTTP —
+  <code>/api/ingest</code>, <code>/api/runs/{id}</code>,
+  <code>/api/documents</code>, <code>/api/query</code> — with the interactive
+  schema at <code>/api/docs</code>.
+</p>
+</main>
+
+<footer>JJRAG — local-only document Q&amp;A.</footer>
+</body>
+</html>

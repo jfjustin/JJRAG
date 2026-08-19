@@ -1,0 +1,87 @@
+# JJRAG — full local stack.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#   docker compose -f deploy/docker-compose.yml exec ollama ollama pull llama3.1:8b
+#
+# Network design (this is the compliance story, not an implementation detail):
+#
+#   • `internal` has no route to the internet. Both the app and the model live
+#     there, so document text physically cannot leave, regardless of code.
+#   • `egress` exists only for the optional cloudflared container, which speaks
+#     outbound to Cloudflare and never receives document text — it only proxies
+#     HTTP requests inward.
+#
+# Without the tunnel profile, nothing in this stack can reach the internet.
+
+name: jjrag
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: jjrag:latest
+    restart: unless-stopped
+    environment:
+      JJRAG_ENVIRONMENT: prod
+      JJRAG_LLM__HOST: http://ollama:11434
+      JJRAG_LLM__MODEL: ${JJRAG_MODEL:-llama3.1:8b}
+      JJRAG_SERVER__HOST: 0.0.0.0
+      # Required in prod: uploads and deletions are authenticated with this.
+      JJRAG_SECURITY__API_TOKEN: ${JJRAG_API_TOKEN:?set JJRAG_API_TOKEN in deploy/.env}
+      # The model server is a named container, not localhost, so allowlist it.
+      JJRAG_SECURITY__EXTRA_ALLOWED_HOSTS: '["ollama"]'
+      JJRAG_LOG_JSON: "true"
+    volumes:
+      - jjrag-data:/app/data
+    networks: [internal]
+    depends_on:
+      ollama:
+        condition: service_started
+    # Published only on loopback: the public path is the tunnel, not this port.
+    ports:
+      - "127.0.0.1:8000:8000"
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    networks: [internal]
+    environment:
+      OLLAMA_KEEP_ALIVE: 15m
+      OLLAMA_NUM_PARALLEL: 2
+    # Uncomment for an NVIDIA GPU (needs the container toolkit on the host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Optional: publish the app on your domain without opening a firewall port.
+  #   docker compose --profile tunnel up -d
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    profiles: [tunnel]
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in deploy/.env}
+    networks: [internal, egress]
+    depends_on: [app]
+
+volumes:
+  jjrag-data:
+  ollama-models:
+
+networks:
+  internal:
+    internal: true      # no route off the host — the core guarantee
+  egress:

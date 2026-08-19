@@ -1,0 +1,41 @@
+# systemd unit for a bare-metal install (no Docker).
+#
+#   sudo cp deploy/jjrag.service /etc/systemd/system/
+#   sudo systemctl enable --now jjrag
+#
+# Assumes: a `jjrag` user, the repo at /opt/jjrag, a venv at /opt/jjrag/.venv,
+# and Ollama already running as its own service.
+
+[Unit]
+Description=JJRAG local document Q&A
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=exec
+User=jjrag
+Group=jjrag
+WorkingDirectory=/opt/jjrag
+Environment=JJRAG_CONFIG_FILE=/opt/jjrag/config/jjrag.yaml
+Environment=JJRAG_ENVIRONMENT=prod
+Environment=HF_HUB_OFFLINE=1
+EnvironmentFile=-/etc/jjrag/jjrag.env
+ExecStart=/opt/jjrag/.venv/bin/uvicorn jjrag.api.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+
+# Hardening — the process only needs its own data directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/jjrag/data
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=6G
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JJRAG — Local-only document Q&amp;A pipeline</title>
+<meta name="description" content="A complete ETL and retrieval pipeline for documents that runs entirely on hardware you control. No hosted model APIs.">
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+</head>
+<body>
+<header class="site">
+  <strong>🔒 JJRAG</strong>
+  <nav>
+    <a href="index.html" class="active">Overview</a>
+    <a href="pipeline.html">Pipeline</a>
+    <a href="hosting.html">Hosting</a>
+    <a href="compliance.html">Compliance</a>
+    <a href="https://github.com/jfjustin/JJRAG">GitHub</a>
+  </nav>
+</header>
+
+<main>
+<h1>Document Q&amp;A that never leaves your machine</h1>
+<p class="lead">
+  JJRAG is a complete data pipeline — extraction, transformation, validation,
+  loading, retrieval and answering — for asking questions of your own
+  documents. Every stage runs on hardware you control. There is no hosted model
+  API in the codebase, and the runtime blocks outbound connections to prove it.
+</p>
+
+<div class="pipeline">
+  <span>upload</span><span>scan</span><span>extract</span><span>transform</span>
+  <span>validate</span><span>embed</span><span>load</span><span>publish</span>
+</div>
+
+<h2>Why local, specifically</h2>
+<p>
+  Sending a document to a hosted model means a third party receives its
+  contents, logs the request, and holds it under their retention policy rather
+  than yours. For regulated data — customer records, health information, legal
+  files, anything under a data-processing agreement that does not name that
+  provider — that is usually the end of the conversation.
+</p>
+<p>
+  JJRAG removes the question rather than answering it. Generation runs on
+  <a href="https://ollama.com">Ollama</a> on your host; embeddings run locally
+  through sentence-transformers; and the process installs a socket-level guard
+  that refuses any connection outside loopback and your configured model host.
+  A dependency that tries to phone home raises an error instead of succeeding
+  quietly.
+</p>
+
+<div class="grid">
+  <div class="card">
+    <h3>Validated, not just loaded</h3>
+    <p>Twenty-plus rules gate the run: empty extractions, garbled text,
+       oversized chunks, zero vectors, dimensionality drift, index/catalog
+       parity. A breach fails the run instead of publishing a broken index.</p>
+  </div>
+  <div class="card">
+    <h3>Atomic index versions</h3>
+    <p>Each run builds a new index beside the live one and only flips the
+       pointer after every gate passes. A failed ingest cannot take your
+       working index down, and rollback is one command.</p>
+  </div>
+  <div class="card">
+    <h3>PII redacted before storage</h3>
+    <p>Emails, phones, national IDs, card numbers, IBANs, IP addresses and API
+       keys are replaced with typed placeholders before anything is indexed —
+       then re-checked, so a leak fails the run.</p>
+  </div>
+  <div class="card">
+    <h3>Auditable end to end</h3>
+    <p>Every run writes a manifest: what was admitted, rejected, redacted,
+       checked and published. Every privileged action lands in an append-only
+       audit log. Both are queryable from the API.</p>
+  </div>
+  <div class="card">
+    <h3>Answers with citations</h3>
+    <p>Hybrid retrieval (semantic + keyword, fused) feeds a local model that is
+       instructed to cite excerpt numbers. When nothing relevant is found, it
+       says so rather than inventing an answer.</p>
+  </div>
+  <div class="card">
+    <h3>Erasure that actually erases</h3>
+    <p>Deleting a document removes it from the catalog and rebuilds the index
+       without it — the deletion reaches the vectors, not just a list.</p>
+  </div>
+</div>
+
+<h2>Quick start</h2>
+<pre><code>git clone https://github.com/jfjustin/JJRAG.git
+cd JJRAG
+pip install -r requirements.txt
+
+# Install a local model (once)
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull llama3.1:8b
+
+# Check the environment, then load documents
+jjrag doctor
+jjrag ingest ~/Documents/policies
+
+# Ask, from the terminal or the browser
+jjrag query "What is our data retention period?"
+jjrag serve            # → http://localhost:8000</code></pre>
+
+<p>
+  Prefer containers? <code>docker compose -f deploy/docker-compose.yml up -d</code>
+  brings up the app and the model on an internal-only Docker network with no
+  route to the internet. See <a href="hosting.html">Hosting</a> to publish it on
+  your own domain.
+</p>
+
+<h2>What it reads</h2>
+<p>
+  PDF (with page-level citations and an optional OCR fallback), DOCX, PPTX,
+  TXT, Markdown, HTML, CSV/TSV, JSON/JSONL and EML. Tabular and structured
+  formats are serialised so that each chunk stays self-describing — a CSV row
+  keeps its column names, an email keeps its headers — which is what makes them
+  retrievable at all.
+</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="pipeline.html">Pipeline reference</a> — every stage, what it
+      guarantees, and the knobs that matter.</li>
+  <li><a href="hosting.html">Hosting</a> — publish on your domain via Cloudflare
+      Tunnel, a VPS, or GoDaddy DNS; plus these docs on GitHub Pages.</li>
+  <li><a href="compliance.html">Compliance</a> — the controls, and how to
+      verify each one rather than take it on trust.</li>
+</ul>
+</main>
+
+<footer>JJRAG — local-only document Q&amp;A. Documents in, answers out, nothing sent anywhere.</footer>
+</body>
+</html>

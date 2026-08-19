@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compliance — JJRAG</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>">
+</head>
+<body>
+<header class="site">
+  <strong>🔒 JJRAG</strong>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="pipeline.html">Pipeline</a>
+    <a href="hosting.html">Hosting</a>
+    <a href="compliance.html" class="active">Compliance</a>
+    <a href="https://github.com/jfjustin/JJRAG">GitHub</a>
+  </nav>
+</header>
+
+<main>
+<h1>Compliance controls</h1>
+<p class="lead">
+  Each control below states what it does and — more usefully — how to check it
+  yourself. A control you cannot verify is a claim, not a control.
+</p>
+
+<h2>1 · No third-party model API exists in the code</h2>
+<p>
+  Not disabled behind a flag, not an optional import: absent. There is no
+  <code>anthropic</code>, <code>openai</code> or other hosted-model client in
+  the dependencies or the source, and CI fails any pull request that adds one.
+</p>
+<pre><code># nothing to find
+grep -rE "^\s*(import|from)\s+(anthropic|openai|cohere|mistralai)\b" jjrag/
+grep -riE "^(anthropic|openai|cohere|mistralai)" requirements.txt pyproject.toml</code></pre>
+
+<h2>2 · Outbound connections are blocked at the socket layer</h2>
+<p>
+  With <code>security.enforce_local_only: true</code> (the default), the process
+  patches the socket layer at startup so any connection outside loopback and the
+  configured model host raises <code>EgressBlocked</code> before a byte leaves.
+  A dependency that tries to phone home fails loudly instead of succeeding
+  quietly.
+</p>
+<pre><code>python -c "
+from jjrag.security import egress
+import socket
+egress.install(['http://localhost:11434'])
+try:
+    socket.getaddrinfo('api.openai.com', 443)
+    print('NOT BLOCKED')
+except egress.EgressBlocked:
+    print('blocked as expected')
+"</code></pre>
+<p>
+  Every blocked attempt is recorded and served at <code>/api/compliance</code>,
+  so an operator can see whether anything tried.
+</p>
+<p>
+  In Docker the same guarantee is enforced a second way, at the network layer:
+  the app and the model sit on a Docker network declared
+  <code>internal: true</code>, which has no route off the host at all.
+</p>
+
+<h2>3 · PII is redacted before storage</h2>
+<p>
+  Emails, phone numbers, national ID numbers, payment cards (Luhn-checked),
+  IBANs (mod-97 checked), IP addresses and API keys are replaced with typed
+  placeholders during transform — before any text reaches the index — and the
+  result is re-scanned afterwards. Residual PII fails the run by default.
+</p>
+<pre><code>curl -s localhost:8000/api/compliance | python -m json.tool
+# → pii_redaction_enabled, pii_types_redacted</code></pre>
+<p>
+  Logs get the same treatment independently: a filter scrubs PII out of every
+  record on its way to a handler, so a stray debug line cannot leak what
+  redaction removed.
+</p>
+
+<h2>4 · Every run is auditable</h2>
+<p>Each run writes a manifest recording:</p>
+<ul>
+  <li>which files were admitted, and which were rejected and why;</li>
+  <li>how many chunks each document produced;</li>
+  <li>what was redacted, by type and count;</li>
+  <li>every validation finding, by rule and severity;</li>
+  <li>the index version published;</li>
+  <li>a fingerprint of the settings that affect index contents, so two runs that
+      differ can be explained.</li>
+</ul>
+<pre><code>jjrag runs                    # history
+jjrag runs run_abc123         # full manifest as JSON
+sqlite3 data/catalog.sqlite3 "SELECT rule, severity, message FROM validation_issues"</code></pre>
+<p>
+  Separately, an append-only audit log at <code>data/logs/audit.jsonl</code>
+  records privileged actions — uploads, rejections, ingests, deletions, queries,
+  rejected authentications — with actor and outcome.
+</p>
+
+<h2>5 · Erasure reaches the vectors</h2>
+<p>
+  Deleting a document marks it in the catalog <em>and</em> rebuilds the index
+  without it. A "deleted" document that remains retrievable is not deleted; here
+  the vectors go too.
+</p>
+<pre><code>jjrag rm doc_abc123
+# or: curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+#          localhost:8000/api/documents/doc_abc123</code></pre>
+<p>
+  Set <code>security.retention_days</code> to erase automatically past a
+  deadline.
+</p>
+
+<h2>6 · Uploads are treated as hostile</h2>
+<table>
+  <tr><th>Control</th><th>Rejects</th></tr>
+  <tr><td>Extension allowlist</td><td>Anything not explicitly permitted.</td></tr>
+  <tr><td>Magic-byte check</td><td>An executable renamed <code>.txt</code>; a binary claiming to be a PDF.</td></tr>
+  <tr><td>Expansion-ratio check</td><td>Zip bombs inside OOXML containers.</td></tr>
+  <tr><td>Macro detection</td><td>VBA payloads inside a <code>.docx</code>.</td></tr>
+  <tr><td>Archive path check</td><td>Path traversal inside a container.</td></tr>
+  <tr><td>Filename sanitising</td><td><code>../../etc/passwd</code> style upload names.</td></tr>
+  <tr><td>Size caps + rate limits</td><td>Resource exhaustion.</td></tr>
+</table>
+<p>Rejected files are quarantined with their reason, not deleted, so refusals stay reviewable.</p>
+
+<h2>7 · The browser is locked down</h2>
+<p>
+  The app serves a strict Content-Security-Policy (<code>default-src 'self'</code>,
+  no third-party origins at all), <code>X-Frame-Options: DENY</code>,
+  <code>nosniff</code>, <code>Referrer-Policy: no-referrer</code>, and HSTS in
+  production. The UI ships no external fonts, scripts or analytics — there is
+  nothing to leak a document title to.
+</p>
+<pre><code>curl -sI localhost:8000/api/health | grep -i content-security-policy</code></pre>
+
+<h2>Live attestation</h2>
+<p>
+  <code>GET /api/compliance</code> returns the running instance's actual posture
+  — not what a document claims, but what the process is configured to do right
+  now. It is unauthenticated by design so a reviewer can check it without
+  credentials, and it exposes configuration only, never content.
+</p>
+<pre><code>{
+  "posture": {
+    "generation_provider": "ollama",
+    "generation_model": "llama3.1:8b",
+    "third_party_model_apis_enabled": false,
+    "egress_restricted_to_localhost": true,
+    "pii_redaction_enabled": true,
+    "validation_gates_enabled": true,
+    "audit_log_enabled": true
+  },
+  "egress_guard_active": true,
+  "blocked_egress_attempts": []
+}</code></pre>
+
+<h2>What this does not do</h2>
+<p>Being straight about the boundaries is part of the control set:</p>
+<ul>
+  <li><strong>It is not a substitute for your own review.</strong> These are
+      engineering controls; whether they satisfy a specific regulation is a
+      determination only you and your counsel can make.</li>
+  <li><strong>Encryption at rest is the host's job.</strong> Use full-disk or
+      volume encryption; JJRAG stores files and SQLite databases in plain form
+      on whatever filesystem you give it.</li>
+  <li><strong>The bearer token is not user management.</strong> It is one shared
+      secret. Put an identity provider in front for real multi-user access.</li>
+  <li><strong>PII detection is pattern-based.</strong> It is deliberately strict
+      about structure (Luhn, mod-97) to limit false positives, which means an
+      unusual identifier format may pass. Review the redaction counts on your
+      own corpus rather than assuming complete coverage.</li>
+  <li><strong>Local models still make mistakes.</strong> Grounding and citations
+      make errors <em>checkable</em>; they do not make them impossible.</li>
+</ul>
+</main>
+
+<footer>JJRAG — local-only document Q&amp;A.</footer>
+</body>
+</html>

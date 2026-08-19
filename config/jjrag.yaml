@@ -1,0 +1,126 @@
+# JJRAG configuration.
+#
+# Every value here can also be set via environment variables using the JJRAG_
+# prefix and __ for nesting, e.g.:
+#   JJRAG_LLM__MODEL=mistral:7b
+#   JJRAG_SECURITY__API_TOKEN=...
+# Environment variables win over this file.
+
+environment: dev          # dev | staging | prod
+log_level: INFO
+log_json: false           # true to emit one JSON object per log line
+
+paths:
+  data_dir: data
+  inbox_dir: data/inbox
+  quarantine_dir: data/quarantine
+  staging_dir: data/staging
+  index_dir: data/index
+  catalog_path: data/catalog.sqlite3
+  cache_path: data/embedding_cache.sqlite3
+  log_dir: data/logs
+
+# ── Extract ───────────────────────────────────────────────────────────────
+ingest:
+  max_file_bytes: 104857600        # 100 MB
+  max_files_per_run: 2000
+  allowed_extensions:
+    - .pdf
+    - .docx
+    - .pptx
+    - .txt
+    - .md
+    - .markdown
+    - .html
+    - .htm
+    - .csv
+    - .tsv
+    - .json
+    - .jsonl
+    - .eml
+  enforce_content_type: true       # magic bytes must match the extension
+  max_archive_expansion_ratio: 120 # zip-bomb guard for OOXML files
+  ocr_enabled: false               # needs tesseract + the [ocr] extra
+  ocr_min_chars_per_page: 40
+
+# ── Transform ─────────────────────────────────────────────────────────────
+transform:
+  chunk_size: 1000
+  chunk_overlap: 150
+  min_chunk_chars: 80
+  normalize_unicode: true
+  dehyphenate: true                # rejoins words split across PDF lines
+  strip_repeated_headers: true
+  drop_duplicate_chunks: true
+  near_duplicate_threshold: 0.92   # 0 disables near-duplicate detection
+
+# ── Privacy ───────────────────────────────────────────────────────────────
+privacy:
+  redact_pii: true
+  pii_types: [email, phone, ssn, credit_card, iban, ip_address, secret]
+  fail_on_residual_pii: true       # a leak fails the run rather than indexing
+  record_redaction_counts: true
+
+# ── Embeddings (local) ────────────────────────────────────────────────────
+embedding:
+  backend: sentence-transformers   # sentence-transformers | ollama | hashing
+  model: sentence-transformers/all-MiniLM-L6-v2
+  ollama_model: nomic-embed-text   # used when backend is "ollama"
+  batch_size: 32
+  normalize: true
+  cache_enabled: true
+  device: cpu                      # "cuda" if you have a GPU
+
+vector_store:
+  backend: numpy                   # numpy | faiss
+  metric: cosine
+  keep_versions: 3                 # older index versions kept for rollback
+
+# ── Retrieval ─────────────────────────────────────────────────────────────
+retrieval:
+  top_k: 5
+  candidate_k: 20
+  hybrid: true                     # dense + BM25, fused with RRF
+  rrf_k: 60
+  mmr_lambda: 0.7                  # 1.0 = relevance only, 0.0 = diversity only
+  max_context_chars: 12000
+
+# ── Generation (local only) ───────────────────────────────────────────────
+llm:
+  provider: ollama
+  host: http://localhost:11434
+  model: llama3.1:8b
+  temperature: 0.1
+  num_ctx: 8192
+  max_tokens: 1024
+  request_timeout_s: 600
+
+# ── Validation gates ──────────────────────────────────────────────────────
+validation:
+  enabled: true
+  max_error_issues: 0              # any error-severity finding fails the run
+  max_warning_ratio: 0.25
+  min_extraction_char_ratio: 0.5
+  min_chunk_chars: 80
+  max_chunk_chars: 4000
+  max_garbled_ratio: 0.30
+  min_alpha_ratio: 0.35
+  require_index_parity: true
+
+# ── Security ──────────────────────────────────────────────────────────────
+security:
+  enforce_local_only: true         # blocks non-loopback sockets in-process
+  extra_allowed_hosts: []          # e.g. ["models.internal"] for a LAN GPU box
+  api_token: null                  # REQUIRED before exposing this publicly
+  allow_anonymous_read: true       # false = the whole app needs the token
+  cors_allow_origins: []
+  rate_limit_per_minute: 60
+  upload_rate_limit_per_minute: 12
+  max_request_bytes: 104857600
+  trusted_proxy_header: cf-connecting-ip
+  audit_log_enabled: true
+  retention_days: null             # e.g. 365 to auto-erase after a year
+
+server:
+  host: 127.0.0.1                  # bind loopback; publish via tunnel/proxy
+  port: 8000

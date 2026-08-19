@@ -1,0 +1,69 @@
+/* JJRAG documentation site — self-contained, no external requests. */
+:root {
+  --bg: #ffffff; --surface: #f6f7f9; --border: #e2e6ea;
+  --text: #14171a; --dim: #5b6470; --accent: #1f6feb;
+  --good: #1a7f37; --bad: #b42318; --warn: #9a6700;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115; --surface: #171a1f; --border: #2b3038;
+    --text: #e6e8eb; --dim: #9aa4b2; --accent: #4c8dff;
+    --good: #4ac26b; --bad: #ff7b72; --warn: #e3b341;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: var(--sans); line-height: 1.65; font-size: 16px;
+}
+header.site {
+  border-bottom: 1px solid var(--border); background: var(--surface);
+  padding: 14px 24px; display: flex; gap: 20px; align-items: center;
+  flex-wrap: wrap; position: sticky; top: 0; z-index: 10;
+}
+header.site strong { font-size: 17px; }
+header.site nav { display: flex; gap: 16px; flex-wrap: wrap; }
+header.site a { color: var(--dim); text-decoration: none; font-size: 14.5px; }
+header.site a:hover, header.site a.active { color: var(--accent); }
+main { max-width: 820px; margin: 0 auto; padding: 36px 22px 80px; }
+h1 { font-size: 30px; line-height: 1.25; margin: 0 0 8px; letter-spacing: -0.02em; }
+h2 { font-size: 21px; margin: 40px 0 12px; padding-top: 8px; border-top: 1px solid var(--border); }
+h3 { font-size: 16.5px; margin: 26px 0 8px; }
+p.lead { font-size: 18px; color: var(--dim); margin: 0 0 28px; }
+a { color: var(--accent); }
+code { font-family: var(--mono); font-size: 0.88em; background: var(--surface); padding: 2px 5px; border-radius: 4px; }
+pre {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px; overflow-x: auto; font-size: 13.5px; line-height: 1.55;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14.5px; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); }
+td code { font-size: 13px; }
+blockquote {
+  margin: 18px 0; padding: 12px 16px; border-left: 3px solid var(--accent);
+  background: var(--surface); border-radius: 0 8px 8px 0; color: var(--dim);
+}
+blockquote.warn { border-left-color: var(--warn); }
+ul, ol { padding-left: 22px; }
+li { margin: 5px 0; }
+.pipeline {
+  display: flex; gap: 6px; flex-wrap: wrap; margin: 22px 0;
+}
+.pipeline span {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 999px; padding: 5px 13px; font-size: 13px; font-family: var(--mono);
+}
+.pipeline span::after { content: " →"; color: var(--dim); }
+.pipeline span:last-child::after { content: ""; }
+.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); margin: 20px 0; }
+.card { border: 1px solid var(--border); border-radius: 10px; padding: 15px; background: var(--surface); }
+.card h3 { margin: 0 0 6px; font-size: 14.5px; }
+.card p { margin: 0; font-size: 14px; color: var(--dim); }
+.good { color: var(--good); font-weight: 600; }
+.bad { color: var(--bad); font-weight: 600; }
+footer { border-top: 1px solid var(--border); color: var(--dim); font-size: 13.5px; padding: 22px; text-align: center; }
+@media (max-width: 640px) { main { padding: 24px 16px 60px; } h1 { font-size: 25px; } }

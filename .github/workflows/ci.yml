@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install (core only — the suite runs without model weights)
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pydantic pydantic-settings PyYAML requests \
+                      fastapi "uvicorn[standard]" python-multipart pypdf \
+                      pytest pytest-cov httpx ruff
+          pip install --no-deps -e .
+
+      - name: Lint
+        run: ruff check jjrag tests
+
+      - name: Test
+        run: pytest --cov=jjrag --cov-report=term-missing
+
+  # Proves the claim the README makes: no hosted-model SDK is reachable from
+  # the shipped code. A PR that reintroduces one fails here.
+  no-cloud-model-clients:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert no hosted-model SDK imports or dependencies
+        run: |
+          set -e
+          if grep -rnE "^\s*(import|from)\s+(anthropic|openai|cohere|google\.generativeai|mistralai)\b" \
+               --include="*.py" jjrag tests; then
+            echo "::error::A hosted-model SDK import was added — JJRAG is local-only."
+            exit 1
+          fi
+          if grep -rniE "^\s*(anthropic|openai|cohere|mistralai)\b" \
+               requirements.txt requirements-dev.txt pyproject.toml; then
+            echo "::error::A hosted-model SDK dependency was added — JJRAG is local-only."
+            exit 1
+          fi
+          echo "OK: no hosted-model SDK imports or dependencies."
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the compose file
+        run: docker compose -f deploy/docker-compose.yml config --quiet
+        env:
+          JJRAG_API_TOKEN: ci-placeholder
+          CLOUDFLARE_TUNNEL_TOKEN: ci-placeholder
