@@ -18,12 +18,14 @@ from pathlib import Path
 
 try:
     from EmQuantAPI import c
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "The EmQuantAPI package is not installed. Download it from "
-        "https://quantapi.eastmoney.com/ and run its installer, "
-        "then retry. See emquant/README.md for step-by-step setup."
-    ) from exc
+except ImportError:  # pragma: no cover
+    c = None
+
+_SDK_MISSING_MSG = (
+    "The EmQuantAPI package is not installed. Download it from "
+    "https://quantapi.eastmoney.com/ and run its installer, "
+    "then retry. See emquant/README.md for step-by-step setup."
+)
 
 _CREDENTIALS_FILE = Path(__file__).with_name("credentials.ini")
 
@@ -61,6 +63,8 @@ def _main_callback(quantdata):
 
 def login(force=True):
     """Start an EMQuantAPI session with the configured account."""
+    if c is None:
+        raise ImportError(_SDK_MISSING_MSG)
     username, password = load_credentials()
     options = f"UserName={username},Password={password}"
     if force:

@@ -53,6 +53,17 @@ python -m emquant.demo_quant
 It logs in, prints a snapshot of a few large caps, downloads six months of
 daily bars, and reports the latest 20/60-day moving-average crossover stance.
 
+## 4. Inspect a single stock
+
+```bash
+python -m emquant.inspect 300274.SZ
+python -m emquant.inspect 600519.SH --start 2025-01-01 --short 10 --long 30
+```
+
+Prints a Choice snapshot (name, close, PE, PB, market value), then pulls
+~18 months of daily bars and reports the 52-week range, trailing returns,
+annualized volatility, the current MA stance, and every crossover date.
+
 ## Module overview
 
 | File | Purpose |
@@ -60,6 +71,7 @@ daily bars, and reports the latest 20/60-day moving-average crossover stance.
 | `em_client.py` | Credential loading + `session()` context manager (login/logout) |
 | `market_data.py` | `index_constituents`, `daily_history` (csd), `snapshot` (css), `moving_average_signal` |
 | `demo_quant.py` | Runnable end-to-end example |
+| `inspect.py` | CLI: `python -m emquant.inspect <code>` — full single-stock report |
 | `credentials.example.ini` | Template for the gitignored `credentials.ini` |
 
 ## Notes

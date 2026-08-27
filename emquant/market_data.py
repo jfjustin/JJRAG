@@ -6,7 +6,14 @@ return pandas DataFrames ready for quant workflows.
 
 import pandas as pd
 
-from .em_client import EmQuantError, c
+from . import em_client
+from .em_client import EmQuantError
+
+
+def _api():
+    if em_client.c is None:
+        raise ImportError(em_client._SDK_MISSING_MSG)
+    return em_client.c
 
 
 def _check(result, what):
@@ -22,7 +29,7 @@ def index_constituents(index_sector_code="009006256", trade_date=None):
     look up other universes in the Choice terminal's sector browser.
     """
     trade_date = trade_date or pd.Timestamp.today().strftime("%Y-%m-%d")
-    result = _check(c.sector(index_sector_code, trade_date), "sector")
+    result = _check(_api().sector(index_sector_code, trade_date), "sector")
     # Data alternates code, name, code, name, ...
     codes = result.Data[::2]
     names = result.Data[1::2]
@@ -38,7 +45,7 @@ def daily_history(codes, start, end, indicators="OPEN,HIGH,LOW,CLOSE,VOLUME,AMOU
     """
     if isinstance(codes, (list, tuple)):
         codes = ",".join(codes)
-    result = _check(c.csd(codes, indicators, start, end, options), "csd")
+    result = _check(_api().csd(codes, indicators, start, end, options), "csd")
 
     # Data[code] is a list with one entry per indicator, each an array of
     # values aligned with result.Dates.
@@ -56,7 +63,7 @@ def snapshot(codes, indicators="NAME,CLOSE,PE,PB,MV", options=""):
     """Cross-sectional snapshot for a list of securities via css."""
     if isinstance(codes, (list, tuple)):
         codes = ",".join(codes)
-    result = _check(c.css(codes, indicators, options), "css")
+    result = _check(_api().css(codes, indicators, options), "css")
     indicator_list = [i.strip() for i in indicators.split(",")]
     rows = {code: dict(zip(indicator_list, values))
             for code, values in result.Data.items()}
