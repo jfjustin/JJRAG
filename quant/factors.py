@@ -15,7 +15,9 @@ one broken factor should not take down the whole report.
 import numpy as np
 import pandas as pd
 
-from . import data
+from . import data, leadlag
+
+TRADING_DAYS = 252
 
 
 def _pct_return(prices, days):
@@ -174,6 +176,52 @@ def capital_flow_factors(fund_flow, northbound, margin):
 
 
 # ---------------------------------------------------------------------------
+# D2. Geometric SDE decomposition
+# ---------------------------------------------------------------------------
+
+def sde_factors(prices, recent_window=20):
+    """Split the price path into drift and diffusion under a geometric SDE.
+
+    DGNSDE evolves each stock's hidden state as dh = mu(.)h dt + sigma(.)h dW —
+    a deterministic trend plus a Brownian noise term, in geometric
+    (proportional) form. The model's own drift/diffusion are neural, but
+    the same decomposition estimated classically on the realized path is
+    directly usable as a factor: fit geometric Brownian motion by moments
+    on log returns and report the annualized drift, the annualized
+    diffusion, and their ratio.
+
+    The drift/diffusion ratio is the signal-to-noise of the price path —
+    how much of the move is trend versus how much is churn. `vol_regime` is
+    recent diffusion over long-run diffusion: >1 means volatility is
+    expanding relative to its own history.
+    """
+    if prices.empty or len(prices) < 30:
+        return {}
+    close = prices.sort_values("date")["close"].astype(float)
+    close = close[close > 0]
+    if len(close) < 30:
+        return {}
+    log_ret = np.diff(np.log(close.values))
+    if len(log_ret) < 20 or not np.isfinite(log_ret).all():
+        return {}
+
+    sigma = float(np.std(log_ret, ddof=1) * np.sqrt(TRADING_DAYS))
+    # GBM drift: the Ito correction turns the mean log return into the
+    # arithmetic drift mu of dS = mu*S*dt + sigma*S*dW.
+    mu = float(np.mean(log_ret) * TRADING_DAYS + 0.5 * sigma ** 2)
+    out = {
+        "sde_drift_annual": mu,
+        "sde_diffusion_annual": sigma,
+        "sde_drift_diffusion_ratio": mu / sigma if sigma > 0 else float("nan"),
+    }
+    if len(log_ret) > recent_window:
+        recent_sigma = float(np.std(log_ret[-recent_window:], ddof=1) * np.sqrt(TRADING_DAYS))
+        out["sde_recent_diffusion_annual"] = recent_sigma
+        out["sde_vol_regime"] = recent_sigma / sigma if sigma > 0 else float("nan")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # E. Cross-sectional linkage (截面联动类) — the centerpiece
 # ---------------------------------------------------------------------------
 
@@ -191,9 +239,15 @@ def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
     - *_percentile_industry / *_percentile_market — this stock's percentile
       rank (0-100) on return and valuation, computed against the live
       industry-peer and whole-market cross-sections (not its own history)
-    - peer_avg_corr / peer_top_correlated — pairwise return-correlation
-      network against its largest industry peers: how much it trades as
+    - peer_avg_corr / peer_top_correlated — same-day pairwise return
+      correlation against its largest industry peers: how much it trades as
       part of the herd vs. idiosyncratically, and who its closest movers are
+    - leadlag_network / leading_peer_signal_pct / target_leadership_days —
+      the DTW lead-lag layer (leadlag.py), which drops the assumption that
+      peers move simultaneously: who leads this stock and by how many
+      (fractional) days, what move those leaders have already made that
+      this stock has not yet followed, and whether this stock is a sector
+      bellwether or a follower
     - fundflow_industry_corr — same-day correlation between this stock's
       own main-fund net inflow and its industry's aggregate net inflow
       (captures whether sector-wide capital rotation is pulling this name
@@ -245,15 +299,18 @@ def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
             out["value_rank_market"] = float(
                 100 - valid["pe_ttm"].rank(pct=True)[valid["code"] == symbol].iloc[0] * 100)
 
-    # Peer correlation network: pairwise return-correlation matrix across
-    # this stock and the largest names in the same industry board — a
-    # cross-sectional relationship structure, not just a stock-vs-peer list.
+    # Peer network. Two layers over the same peer set:
+    #   (a) same-day return-correlation matrix — the conventional picture,
+    #       which assumes information reaches every name simultaneously;
+    #   (b) the DTW lead-lag network, which drops that assumption and
+    #       measures who moves first (see leadlag.py).
     if industry_peers is not None and not industry_peers.empty:
         peers = (industry_peers[industry_peers["code"] != symbol]
                 .sort_values("amount", ascending=False)
                 .head(max_peers))
         target_label = f"{symbol} (本股 target)"
         return_series = {target_label: stock_ret}
+        close_series = {target_label: p["close"]}
         for _, peer in peers.iterrows():
             try:
                 peer_prices = peer_history_fn(peer["code"])
@@ -261,9 +318,10 @@ def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
                 continue
             if peer_prices is None or peer_prices.empty:
                 continue
-            peer_ret = (peer_prices.sort_values("date").set_index("date")["close"]
-                       .pct_change())
-            return_series[f"{peer['code']} {peer['name']}"] = peer_ret
+            peer_close = peer_prices.sort_values("date").set_index("date")["close"]
+            label = f"{peer['code']} {peer['name']}"
+            return_series[label] = peer_close.pct_change()
+            close_series[label] = peer_close
 
         if len(return_series) >= 3:
             returns_df = pd.concat(return_series, axis=1, join="inner").dropna(how="all")
@@ -279,6 +337,17 @@ def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
                         target_corrs.sort_values(ascending=False).head(3).items()
                     ]
                     out["peer_corr_matrix"] = corr_matrix
+
+        # --- Lead-lag layer -------------------------------------------
+        peer_closes = {k: v for k, v in close_series.items() if k != target_label}
+        if peer_closes:
+            network = leadlag.build_leadlag_network(close_series[target_label],
+                                                    peer_closes)
+            if not network.empty:
+                out["leadlag_network"] = network
+                out["leadlag_peer_closes"] = peer_closes
+                out.update(leadlag.network_summary(network))
+                out.update(leadlag.leading_peer_signal(network, peer_closes))
 
     # Capital-flow linkage: does sector-wide money flow move with this
     # stock's own money flow (same-day correlation)?

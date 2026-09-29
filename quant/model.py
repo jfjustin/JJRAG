@@ -16,12 +16,17 @@ calibrated probability.
 
 import numpy as np
 
+# Linkage carries the largest single weight on the strength of DGNSDE's
+# ablation, where removing the delay-aware graph cost more than removing
+# any other component (CSI300 annualized return 60.9% -> 40.0%, RankIC
+# 0.058 -> 0.027). That is evidence from the paper's setup, not from a
+# backtest of *this* scoring model — see the honesty note in the docstring.
 CATEGORY_WEIGHTS = {
     "technical": 0.25,
     "valuation": 0.15,
     "growth_quality": 0.20,
-    "capital_flow": 0.15,
-    "linkage": 0.25,
+    "capital_flow": 0.10,
+    "linkage": 0.30,
 }
 
 STANCE_BANDS = [
@@ -49,9 +54,24 @@ def _band_score(value, center, width):
     return max(0.0, 100 - dist / width * 100)
 
 
-def _avg(scores):
-    valid = [s for s in scores if s is not None and not (isinstance(s, float) and np.isnan(s))]
-    return float(np.mean(valid)) if valid else float("nan")
+def _avg(scores, weights=None):
+    """Average the valid sub-scores, optionally weighted by name.
+
+    Sub-factors that came back NaN drop out of both the numerator and the
+    denominator, so missing data shrinks the sample rather than scoring 0.
+    """
+    if isinstance(scores, dict):
+        items = list(scores.items())
+    else:
+        items = [(None, s) for s in scores]
+    num, den = 0.0, 0.0
+    for name, s in items:
+        if s is None or (isinstance(s, float) and np.isnan(s)):
+            continue
+        w = (weights or {}).get(name, 1.0)
+        num += s * w
+        den += w
+    return num / den if den > 0 else float("nan")
 
 
 def score_technical(f):
@@ -65,8 +85,12 @@ def score_technical(f):
         "ret_1m": _clip_linear(f.get("ret_1m"), -15, 15),
         "ret_3m": _clip_linear(f.get("ret_3m"), -25, 25),
         "low_volatility": _clip_linear(f.get("vol_20d_annualized_pct"), 20, 80, invert=True),
+        # Geometric-SDE path quality: trend per unit of noise, and whether
+        # the diffusion term is expanding against its own history.
+        "sde_drift_diffusion": _clip_linear(f.get("sde_drift_diffusion_ratio"), -1.5, 1.5),
+        "sde_vol_regime_calm": _clip_linear(f.get("sde_vol_regime"), 0.6, 1.8, invert=True),
     }
-    return _avg(scores.values()), scores
+    return _avg(scores), scores
 
 
 def score_valuation(f, linkage):
@@ -75,7 +99,7 @@ def score_valuation(f, linkage):
         "value_rank_market": linkage.get("value_rank_market", np.nan),
         "pe_sanity": _band_score(f.get("pe_ttm"), center=25, width=60) if f.get("pe_ttm", 0) and f.get("pe_ttm") > 0 else np.nan,
     }
-    return _avg(scores.values()), scores
+    return _avg(scores), scores
 
 
 def score_growth_quality(f):
@@ -86,7 +110,7 @@ def score_growth_quality(f):
         "roe": _clip_linear(f.get("roe_pct"), 0, 25),
         "eps_trend": _clip_linear(f.get("eps_trend_slope"), -0.2, 0.2) if "eps_trend_slope" in f else np.nan,
     }
-    return _avg(scores.values()), scores
+    return _avg(scores), scores
 
 
 def score_capital_flow(f):
@@ -95,7 +119,7 @@ def score_capital_flow(f):
         "main_inflow_20d": _clip_linear(f.get("main_inflow_20d_sum"), -5e8, 5e8),
         "northbound_chg_20d": _clip_linear(f.get("northbound_hold_ratio_chg_20d"), -0.5, 0.5),
     }
-    return _avg(scores.values()), scores
+    return _avg(scores), scores
 
 
 def score_linkage(linkage):
@@ -105,8 +129,12 @@ def score_linkage(linkage):
         "industry_r2_moderate": _band_score(linkage.get("industry_r2"), center=0.35, width=0.5),
         "fundflow_industry_corr": _clip_linear(linkage.get("fundflow_industry_corr"), -1, 1),
         "peer_avg_corr_moderate": _band_score(linkage.get("peer_avg_corr"), center=0.5, width=0.7),
+        "leading_peer_signal": _clip_linear(linkage.get("leading_peer_signal_pct"), -5, 5),
     }
-    return _avg(scores.values()), scores
+    # The lead-lag signal is the one genuinely forward-looking factor here —
+    # everything else describes the present cross-section — so it counts
+    # double within the category.
+    return _avg(scores, weights={"leading_peer_signal": 2.0}), scores
 
 
 def stance_for(score):

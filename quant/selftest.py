@@ -11,10 +11,56 @@ against the network for that.
 """
 
 import sys
+import zlib
 from unittest import mock
 
 import numpy as np
 import pandas as pd
+
+
+def _hist_from_close(close, seed=0):
+    """Wrap a close-price array in the column layout stock_zh_a_hist returns."""
+    n = len(close)
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2025-01-02", periods=n)
+    close = np.asarray(close, dtype=float)
+    open_ = close * (1 + rng.normal(0, 0.003, n))
+    high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.005, n)))
+    low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.005, n)))
+    volume = rng.integers(1_000_000, 8_000_000, n)
+    amount = volume * close
+    return pd.DataFrame({
+        "日期": dates.strftime("%Y-%m-%d"),
+        "开盘": open_.round(2), "收盘": close.round(2),
+        "最高": high.round(2), "最低": low.round(2),
+        "成交量": volume, "成交额": amount.round(0),
+        "振幅": (rng.uniform(1, 5, n)).round(2),
+        "涨跌幅": (pd.Series(close).pct_change().fillna(0) * 100).round(2),
+        "涨跌额": pd.Series(close).diff().fillna(0).round(2),
+        "换手率": rng.uniform(0.5, 6, n).round(2),
+    })
+
+
+def _sector_universe(n=400, max_shift=6, seed=5):
+    """A sector factor plus per-symbol lead/lag offsets.
+
+    Symbol i's returns are the sector factor read `lead_i` days *ahead* of
+    the target's, so a symbol with lead_i > 0 genuinely moves before the
+    target — which is what the lead-lag estimator has to recover. Two
+    symbols get zero loading on the factor (pure noise) to confirm they are
+    filtered out rather than scored.
+    """
+    rng = np.random.default_rng(seed)
+    pad = max_shift + 2
+    sector = pd.Series(rng.normal(0.0004, 1.0, n + 2 * pad)).rolling(4).mean().fillna(0).values * 0.018
+
+    def series_for(lead, beta, noise_seed, start_price):
+        r = np.random.default_rng(noise_seed)
+        start = pad + int(round(lead))
+        rets = sector[start:start + n] * beta + r.normal(0, 0.012, n)
+        return start_price * np.exp(np.cumsum(rets))
+
+    return series_for
 
 
 def _synthetic_hist(n=400, seed=0, start_price=100.0):
@@ -73,12 +119,27 @@ def run():
     target_industry = "电源设备"
 
     hist_cache = {}
+    series_for = _sector_universe()
+    # Deterministic lead assignment: the target sits at 0, some peers lead
+    # it by 2-4 days, some lag, and two carry no sector loading at all.
+    LEADS = {"300000": 3.0, "300001": 2.0, "300002": 4.0,
+             "300003": -2.0, "300004": -3.0}
+    NOISE_ONLY = {"300005", "300006"}
 
     def fake_stock_zh_a_hist(symbol, **kwargs):
         if symbol not in hist_cache:
-            seed = abs(hash(symbol)) % (2 ** 31)
-            hist_cache[symbol] = _synthetic_hist(seed=seed,
-                                                 start_price=float(50 + seed % 150))
+            # crc32, not hash(): str hashing is salted per process, which
+            # would make this test's data — and its assertions — differ
+            # from run to run.
+            seed = zlib.crc32(symbol.encode()) % (2 ** 31)
+            if symbol == target_code:
+                close = series_for(0.0, 1.0, seed, 110.0)
+            elif symbol in NOISE_ONLY:
+                close = series_for(0.0, 0.0, seed, 60.0)
+            else:
+                lead = LEADS.get(symbol, float((seed % 7) - 3))
+                close = series_for(lead, 0.9, seed, float(50 + seed % 150))
+            hist_cache[symbol] = _hist_from_close(close, seed=seed)
         return hist_cache[symbol]
 
     def fake_individual_info_em(symbol, **kwargs):
@@ -192,10 +253,20 @@ def run():
         for k, v in detail.items():
             if isinstance(v, float):
                 print(f"      {k:28s} {v:.1f}" if v == v else f"      {k:28s} n/a")
-    print("\nLinkage factors:", {k: v for k, v in result.linkage.items()
-                                 if k not in ("peer_corr_matrix", "peer_top_correlated")})
+    bulky = ("peer_corr_matrix", "peer_top_correlated",
+             "leadlag_network", "leadlag_peer_closes")
+    print("\nLinkage factors:")
+    for k, v in result.linkage.items():
+        if k not in bulky:
+            print(f"  {k:32s} {v:.4f}" if isinstance(v, float) else f"  {k:32s} {v}")
     if "peer_top_correlated" in result.linkage:
         print("Top correlated peers:", result.linkage["peer_top_correlated"])
+
+    net = result.linkage.get("leadlag_network")
+    if net is not None and not net.empty:
+        print("\nLead-lag network (positive lead_days = peer leads this stock):")
+        print(net[["lead_days", "aligned_corr", "trend_similarity", "overlap"]]
+              .sort_values("lead_days", ascending=False).round(3).to_string())
     if result.warnings:
         print("\nWarnings:")
         for w in result.warnings:
@@ -207,6 +278,19 @@ def run():
     assert "industry_beta" in result.linkage
     assert "ret_today_pctile_industry" in result.linkage
     assert "peer_avg_corr" in result.linkage
+    assert "sde_drift_annual" in result.technical
+    assert "sde_drift_diffusion_ratio" in result.technical
+
+    # The lead-lag layer must actually fire on data built to contain leaders.
+    assert net is not None and not net.empty, "lead-lag network is empty"
+    assert result.linkage.get("n_leading_peers", 0) > 0, \
+        "no leading peers found despite synthetic leaders in the universe"
+    signal = result.linkage.get("leading_peer_signal_pct")
+    assert signal is not None and signal == signal, \
+        "leading_peer_signal_pct did not compute"
+    # Sector-loaded peers should read as more linked than the noise-only ones.
+    linked = net["aligned_corr"].dropna()
+    assert linked.max() > 0.3, f"no peer showed real linkage (max corr {linked.max():.2f})"
     print("\nSelf-test passed.")
 
 

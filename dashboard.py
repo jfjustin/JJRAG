@@ -20,6 +20,7 @@ VIEWS = [
     ("overview", "📊 综合评分 Overview"),
     ("price", "📈 K线走势 Price Chart"),
     ("linkage", "🔗 截面联动分析 Cross-Sectional Linkage"),
+    ("leadlag", "⏱️ 时滞联动 Lead-Lag Network"),
     ("flow", "💰 资金流向 Capital Flow"),
     ("radar", "🎯 因子雷达图 Factor Radar"),
 ]
@@ -168,6 +169,22 @@ if r is not None:
                                   title="成交量 Volume")
             st.plotly_chart(vol_fig, use_container_width=True)
 
+            t = r.technical
+            st.subheader("几何SDE分解 Geometric-SDE decomposition")
+            st.caption("Fitting dS = μ·S·dt + σ·S·dW to the realized path: μ is the "
+                      "deterministic trend, σ the stochastic diffusion. Their ratio is "
+                      "the path's signal-to-noise.")
+            s = st.columns(4)
+            def _sde(col, label, key, fmt, helptext=None):
+                v = t.get(key, float("nan"))
+                col.metric(label, fmt.format(v) if v == v else "n/a", help=helptext)
+            _sde(s[0], "漂移项 Drift μ (annual)", "sde_drift_annual", "{:+.1%}")
+            _sde(s[1], "扩散项 Diffusion σ (annual)", "sde_diffusion_annual", "{:.1%}")
+            _sde(s[2], "信噪比 μ/σ", "sde_drift_diffusion_ratio", "{:+.2f}",
+                 "Trend per unit of noise — a Sharpe-like reading of the path.")
+            _sde(s[3], "波动区制 Vol regime", "sde_vol_regime", "{:.2f}",
+                 "Recent diffusion / long-run diffusion. >1 = volatility expanding.")
+
     # -----------------------------------------------------------------
     # Cross-sectional linkage
     # -----------------------------------------------------------------
@@ -220,6 +237,84 @@ if r is not None:
         else:
             st.info("Peer correlation network unavailable (industry classification or peer "
                     "history missing for this code).")
+
+    # -----------------------------------------------------------------
+    # Lead-lag network (DTW delay-aware layer)
+    # -----------------------------------------------------------------
+    elif view == "leadlag":
+        link = r.linkage
+        net = link.get("leadlag_network")
+        st.subheader("时滞联动 Lead-lag structure")
+        st.caption(
+            "Two-stage DTW per peer: warp the price paths to read the "
+            "(fractional) day offset at which they align, then shift by that "
+            "offset and measure how alike the return paths are. "
+            "**Positive lead = that peer moves before this stock.** "
+            "`aligned_corr` is the correlation of the delay-aligned returns — "
+            "near zero means the pairing is noise, whatever the delay says."
+        )
+
+        m = st.columns(4)
+        sig = link.get("leading_peer_signal_pct", float("nan"))
+        m[0].metric("领先股信号 Leading-peer signal",
+                    f"{sig:+.2f}%" if sig == sig else "n/a",
+                    help="Move the leading peers have already made that this "
+                         "stock has not yet followed. Positive = bullish pressure.")
+        m[1].metric("领先股数量 Leading peers",
+                    link.get("n_leading_peers", 0))
+        lead_days = link.get("leading_peer_mean_lead_days", float("nan"))
+        m[2].metric("平均领先天数 Mean lead",
+                    f"{lead_days:.1f}d" if lead_days == lead_days else "n/a")
+        leadership = link.get("target_leadership_days", float("nan"))
+        m[3].metric("本股地位 This stock's role",
+                    ("领先 Leader" if leadership > 0.5 else
+                     "滞后 Follower" if leadership < -0.5 else "同步 In-step")
+                    if leadership == leadership else "n/a",
+                    delta=f"{leadership:+.1f}d vs peers" if leadership == leadership else None)
+
+        if net is not None and not net.empty:
+            plot_df = net.sort_values("lead_days")
+            fig = go.Figure(go.Bar(
+                x=plot_df["lead_days"], y=plot_df.index, orientation="h",
+                marker=dict(
+                    color=plot_df["aligned_corr"], colorscale="RdBu", cmid=0,
+                    cmin=-1, cmax=1, colorbar=dict(title="aligned<br>corr"),
+                ),
+                hovertemplate="%{y}<br>lead: %{x:.2f}d<br>corr: %{marker.color:.2f}<extra></extra>",
+            ))
+            fig.add_vline(x=0, line_width=1, line_color="#555")
+            fig.update_layout(
+                height=max(380, 30 * len(plot_df)),
+                margin=dict(l=10, r=10, t=30, b=10),
+                xaxis_title="← 滞后 lags this stock    |    领先 leads this stock →",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("真实联动 vs 噪声 Real linkage vs noise")
+            st.caption("Peers cluster to the right of ~0.2 aligned correlation only "
+                      "when the lead-lag relationship is real; the rest is warping noise.")
+            scat = go.Figure(go.Scatter(
+                x=net["lead_days"], y=net["aligned_corr"], mode="markers+text",
+                text=[label.split()[0] for label in net.index],
+                textposition="top center",
+                marker=dict(size=11, color=net["trend_similarity"],
+                            colorscale="Viridis", showscale=True,
+                            colorbar=dict(title="DTW<br>similarity")),
+            ))
+            scat.add_hline(y=0.2, line_dash="dash", line_color="#888",
+                          annotation_text="signal inclusion threshold")
+            scat.add_vline(x=0, line_width=1, line_color="#555")
+            scat.update_layout(height=430, margin=dict(l=10, r=10, t=10, b=10),
+                              xaxis_title="lead_days (positive = peer leads)",
+                              yaxis_title="aligned return correlation")
+            st.plotly_chart(scat, use_container_width=True)
+
+            with st.expander("完整时滞表 Full lead-lag table"):
+                st.dataframe(net.sort_values("lead_days", ascending=False).round(3),
+                            use_container_width=True)
+        else:
+            st.info("Lead-lag network unavailable — needs an industry peer list "
+                   "and at least 30 overlapping trading days per peer.")
 
     # -----------------------------------------------------------------
     # Capital flow
@@ -288,7 +383,9 @@ if r is not None:
                   **{f"valuation.{k}": v for k, v in r.valuation.items()},
                   **{f"growth_quality.{k}": v for k, v in r.growth_quality.items()},
                   **{f"capital_flow.{k}": v for k, v in r.capital_flow.items()},
-                  **{k: v for k, v in r.linkage.items() if k != "peer_corr_matrix"}}
+                  **{k: v for k, v in r.linkage.items()
+                     if k not in ("peer_corr_matrix", "leadlag_network",
+                                  "leadlag_peer_closes", "peer_top_correlated")}}
         summary_df = pd.DataFrame(summary.items(), columns=["factor", "value"])
         st.download_button("⬇️ 下载因子数据 Download factor summary CSV",
                           summary_df.to_csv(index=False),

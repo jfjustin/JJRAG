@@ -118,6 +118,8 @@ def build_report(code, lookback_days=548, short_ma=20, long_ma=60):
         return data.daily_history(peer_code, start, end)
 
     tech = factors.technical_factors(prices, short=short_ma, long=long_ma) if not prices.empty else {}
+    # Geometric-SDE drift/diffusion live alongside the other path factors.
+    tech.update(factors.sde_factors(prices) if not prices.empty else {})
     val = factors.valuation_factors(snapshot_row)
     gq = factors.growth_quality_factors(financials)
     cf = factors.capital_flow_factors(fund_flow, northbound, margin)
