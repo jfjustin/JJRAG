@@ -96,6 +96,19 @@ Open the URL Streamlit prints (default `http://localhost:8501`).
 Copy `.env.example` to `.env` to override defaults (e.g. `OLLAMA_HOST`).
 Environment-variable keys are optional — the in-app key box is the primary path.
 
+## Quant dashboard
+
+This repo also ships a separate, unrelated tool: a local Streamlit dashboard
+for cross-sectional multi-factor equity analysis (China A-shares), built on
+free AKShare data — no paid account or API key required. See
+[`quant/README.md`](quant/README.md) for setup and methodology, or jump
+straight in:
+
+```bash
+pip install -r requirements.txt
+streamlit run dashboard.py
+```
+
 ## Original design notes
 
 The initial design write-up and the original prototype (`JJrag.py`) are kept in

@@ -4,9 +4,8 @@ key.env
 *.key
 secrets.*
 
-# EMQuantAPI credentials + runtime logs — never commit
-emquant/credentials.ini
-EmQuantAPI*.log
+# quant/ local cache (fetched market data, safe to delete)
+quant/.cache/
 
 # Runtime artifacts
 rag_app.log

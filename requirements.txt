@@ -18,3 +18,10 @@ openai>=1.30
 
 # Local generation (Privacy mode) is served by Ollama (https://ollama.com),
 # installed separately as a system binary — not a Python package.
+
+# Quant dashboard (quant/, dashboard.py) — free AKShare market data,
+# no account/credentials needed
+akshare>=1.18
+pandas>=2.0
+numpy>=1.24
+plotly>=5.20
