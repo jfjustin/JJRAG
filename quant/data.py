@@ -125,6 +125,81 @@ def daily_history(code, start, end, adjust="qfq", ttl=1800):
     return out
 
 
+def intraday_history(code, start, end, period="60", adjust="qfq", ttl=900):
+    """Minute bars (period in {"5","15","30","60"}) between two dates, in the
+    same column layout as daily_history with `date` holding the bar's
+    timestamp. 60-minute A-share bars close at 10:30, 11:30, 14:00, 15:00 —
+    four per session."""
+    symbol, _ = normalize_code(code)
+    key = f"min:{symbol}:{period}:{start}:{end}:{adjust}"
+
+    def fetch():
+        return ak.stock_zh_a_hist_min_em(
+            symbol=symbol, period=period, adjust=adjust,
+            start_date=f"{start} 09:30:00", end_date=f"{end} 15:00:00",
+        )
+
+    df = cache.get_or_fetch(key, fetch, ttl_seconds=ttl)
+    cols = ["date", "open", "close", "high", "low", "volume", "amount",
+            "amplitude", "pct_chg", "chg", "turnover"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df["时间"]),
+        "open": _to_num(df["开盘"]),
+        "close": _to_num(df["收盘"]),
+        "high": _to_num(df["最高"]),
+        "low": _to_num(df["最低"]),
+        "volume": _to_num(df["成交量"]),
+        "amount": _to_num(df["成交额"]),
+        "amplitude": _to_num(_pick(df, "振幅", default=pd.Series(dtype=float))),
+        "pct_chg": _to_num(_pick(df, "涨跌幅", default=pd.Series(dtype=float))),
+        "chg": _to_num(_pick(df, "涨跌额", default=pd.Series(dtype=float))),
+        "turnover": _to_num(_pick(df, "换手率", default=pd.Series(dtype=float))),
+    })
+    return (out.dropna(subset=["close"]).sort_values("date")
+            .reset_index(drop=True))
+
+
+def index_intraday(index_code, start, end, period="60", ttl=900):
+    """Index minute bars; index_code is the bare 6-digit code, e.g. '000300'."""
+    key = f"idxmin:{index_code}:{period}:{start}:{end}"
+
+    def fetch():
+        return ak.index_zh_a_hist_min_em(
+            symbol=index_code, period=period,
+            start_date=f"{start} 09:30:00", end_date=f"{end} 15:00:00",
+        )
+
+    df = cache.get_or_fetch(key, fetch, ttl_seconds=ttl)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date", "close"])
+    return (pd.DataFrame({"date": pd.to_datetime(df["时间"]),
+                          "close": _to_num(df["收盘"])})
+            .dropna().sort_values("date").reset_index(drop=True))
+
+
+def industry_intraday(industry_name, start, end, period="60", ttl=900):
+    """Industry-board minute bars. The endpoint has no date filter, so the
+    full available history is cached and the window is cut here."""
+    key = f"indmin:{industry_name}:{period}"
+
+    def fetch():
+        return ak.stock_board_industry_hist_min_em(symbol=industry_name,
+                                                   period=period)
+
+    df = cache.get_or_fetch(key, fetch, ttl_seconds=ttl)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date", "close"])
+    date_col = _pick_col(df, "日期时间", "时间")
+    out = (pd.DataFrame({"date": pd.to_datetime(df[date_col]),
+                         "close": _to_num(df["收盘"])})
+           .dropna().sort_values("date"))
+    lo = pd.Timestamp(start)
+    hi = pd.Timestamp(end) + pd.Timedelta(days=1)
+    return out[(out["date"] >= lo) & (out["date"] < hi)].reset_index(drop=True)
+
+
 def index_history(index_symbol, start, end, ttl=1800):
     """Broad index daily history, e.g. index_symbol='sh000300' (CSI 300)."""
     key = f"idx:{index_symbol}:{start}:{end}"

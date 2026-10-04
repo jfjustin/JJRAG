@@ -20,10 +20,21 @@ from . import data, leadlag
 TRADING_DAYS = 252
 
 
+def _covers(prices, days, slack_days=7):
+    """True if the history reaches back `days` calendar days (allowing a
+    week of slack for weekends and holidays at the start)."""
+    if prices.empty:
+        return False
+    span = prices["date"].iloc[-1] - prices["date"].iloc[0]
+    return span >= pd.Timedelta(days=days - slack_days)
+
+
 def _pct_return(prices, days):
     """Trailing simple return over `days` calendar days, using the closest
-    available bar on/after `today - days`."""
-    if prices.empty:
+    available bar on/after `today - days`. NaN when the history is shorter
+    than the span — otherwise a two-month window would report its own
+    two-month return under a 12-month label."""
+    if prices.empty or not _covers(prices, days):
         return float("nan")
     last = prices.iloc[-1]
     cutoff = last["date"] - pd.Timedelta(days=days)
@@ -54,7 +65,11 @@ def _rolling_beta_corr(stock_ret, bench_ret):
 # A. Technical (time-series, own history only)
 # ---------------------------------------------------------------------------
 
-def technical_factors(prices, short=20, long=60):
+def technical_factors(prices, short=20, long=60, bars_per_day=1):
+    """Indicators are computed in bars of whatever timeframe `prices` is
+    (MA/RSI/MACD on 60-minute bars are 60-minute indicators). Volatility
+    windows and annualization are converted to trading days via
+    `bars_per_day` so vol_20d means 20 trading days at any timeframe."""
     if prices.empty or len(prices) < long + 5:
         return {}
     p = prices.sort_values("date").reset_index(drop=True)
@@ -82,10 +97,13 @@ def technical_factors(prices, short=20, long=60):
     boll_std = close.rolling(20).std()
     boll_pct_b = (close - (boll_mid - 2 * boll_std)) / (4 * boll_std).replace(0, np.nan)
 
-    vol20 = ret.tail(20).std() * np.sqrt(250) * 100
-    vol60 = ret.tail(60).std() * np.sqrt(250) * 100
+    annualizer = np.sqrt(TRADING_DAYS * bars_per_day)
+    vol20 = ret.tail(20 * bars_per_day).std() * annualizer * 100
+    vol60 = (ret.tail(60 * bars_per_day).std() * annualizer * 100
+             if len(ret) >= 60 * bars_per_day else np.nan)
 
     turnover_ma20 = p["turnover"].rolling(20).mean().iloc[-1] if "turnover" in p else np.nan
+    has_year = _covers(p, 365)
 
     return {
         "ma_short": ma_short.iloc[-1],
@@ -106,8 +124,11 @@ def technical_factors(prices, short=20, long=60):
         "vol_20d_annualized_pct": vol20,
         "vol_60d_annualized_pct": vol60,
         "turnover_ma20_pct": turnover_ma20,
-        "hi_52w": p[p["date"] >= p["date"].max() - pd.Timedelta(days=365)]["close"].max(),
-        "lo_52w": p[p["date"] >= p["date"].max() - pd.Timedelta(days=365)]["close"].min(),
+        "hi_52w": p[p["date"] >= p["date"].max() - pd.Timedelta(days=365)]["close"].max() if has_year else np.nan,
+        "lo_52w": p[p["date"] >= p["date"].max() - pd.Timedelta(days=365)]["close"].min() if has_year else np.nan,
+        "hi_window": close.max(),
+        "lo_window": close.min(),
+        "ret_window": (close.iloc[-1] / close.iloc[0] - 1) * 100,
     }
 
 
@@ -179,7 +200,7 @@ def capital_flow_factors(fund_flow, northbound, margin):
 # D2. Geometric SDE decomposition
 # ---------------------------------------------------------------------------
 
-def sde_factors(prices, recent_window=20):
+def sde_factors(prices, recent_days=20, bars_per_day=1):
     """Split the price path into drift and diffusion under a geometric SDE.
 
     DGNSDE evolves each stock's hidden state as dh = mu(.)h dt + sigma(.)h dW —
@@ -205,17 +226,19 @@ def sde_factors(prices, recent_window=20):
     if len(log_ret) < 20 or not np.isfinite(log_ret).all():
         return {}
 
-    sigma = float(np.std(log_ret, ddof=1) * np.sqrt(TRADING_DAYS))
+    bars_per_year = TRADING_DAYS * bars_per_day
+    recent_window = recent_days * bars_per_day
+    sigma = float(np.std(log_ret, ddof=1) * np.sqrt(bars_per_year))
     # GBM drift: the Ito correction turns the mean log return into the
     # arithmetic drift mu of dS = mu*S*dt + sigma*S*dW.
-    mu = float(np.mean(log_ret) * TRADING_DAYS + 0.5 * sigma ** 2)
+    mu = float(np.mean(log_ret) * bars_per_year + 0.5 * sigma ** 2)
     out = {
         "sde_drift_annual": mu,
         "sde_diffusion_annual": sigma,
         "sde_drift_diffusion_ratio": mu / sigma if sigma > 0 else float("nan"),
     }
     if len(log_ret) > recent_window:
-        recent_sigma = float(np.std(log_ret[-recent_window:], ddof=1) * np.sqrt(TRADING_DAYS))
+        recent_sigma = float(np.std(log_ret[-recent_window:], ddof=1) * np.sqrt(bars_per_year))
         out["sde_recent_diffusion_annual"] = recent_sigma
         out["sde_vol_regime"] = recent_sigma / sigma if sigma > 0 else float("nan")
     return out
@@ -228,7 +251,9 @@ def sde_factors(prices, recent_window=20):
 def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
                     industry_peers, fund_flow, sector_flow,
                     market_index_prices, industry_index_prices,
-                    peer_history_fn, max_peers=12):
+                    peer_history_fn, max_peers=12, beta_window=120,
+                    leadlag_window=leadlag.DEFAULT_WINDOW,
+                    max_lead=leadlag.MAX_LEAD_DAYS):
     """Cross-sectional and co-movement factors:
 
     - market_beta / market_corr / market_r2 — how much of this stock's
@@ -243,7 +268,7 @@ def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
       correlation against its largest industry peers: how much it trades as
       part of the herd vs. idiosyncratically, and who its closest movers are
     - leadlag_network / leading_peer_signal_pct / target_leadership_days —
-      the DTW lead-lag layer (leadlag.py), which drops the assumption that
+      the lead-lag layer (leadlag.py), which drops the assumption that
       peers move simultaneously: who leads this stock and by how many
       (fractional) days, what move those leaders have already made that
       this stock has not yet followed, and whether this stock is a sector
@@ -260,7 +285,7 @@ def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
     if market_index_prices is not None and not market_index_prices.empty:
         mkt_ret = (market_index_prices.set_index("date")["close"]
                   .pct_change().rename("market"))
-        beta, corr, r2 = _rolling_beta_corr(stock_ret.tail(120), mkt_ret.tail(120))
+        beta, corr, r2 = _rolling_beta_corr(stock_ret.tail(beta_window), mkt_ret.tail(beta_window))
         out["market_beta"] = beta
         out["market_corr"] = corr
         out["market_r2"] = r2
@@ -268,7 +293,7 @@ def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
     if industry_index_prices is not None and not industry_index_prices.empty:
         ind_ret = (industry_index_prices.set_index("date")["close"]
                   .pct_change().rename("industry"))
-        beta, corr, r2 = _rolling_beta_corr(stock_ret.tail(120), ind_ret.tail(120))
+        beta, corr, r2 = _rolling_beta_corr(stock_ret.tail(beta_window), ind_ret.tail(beta_window))
         out["industry_beta"] = beta
         out["industry_corr"] = corr
         out["industry_r2"] = r2
@@ -302,7 +327,7 @@ def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
     # Peer network. Two layers over the same peer set:
     #   (a) same-day return-correlation matrix — the conventional picture,
     #       which assumes information reaches every name simultaneously;
-    #   (b) the DTW lead-lag network, which drops that assumption and
+    #   (b) the lead-lag network, which drops that assumption and
     #       measures who moves first (see leadlag.py).
     if industry_peers is not None and not industry_peers.empty:
         peers = (industry_peers[industry_peers["code"] != symbol]
@@ -342,7 +367,9 @@ def linkage_factors(code, prices, industry_name, snapshot_row, market_snap,
         peer_closes = {k: v for k, v in close_series.items() if k != target_label}
         if peer_closes:
             network = leadlag.build_leadlag_network(close_series[target_label],
-                                                    peer_closes)
+                                                    peer_closes,
+                                                    window=leadlag_window,
+                                                    max_lead=max_lead)
             if not network.empty:
                 out["leadlag_network"] = network
                 out["leadlag_peer_closes"] = peer_closes

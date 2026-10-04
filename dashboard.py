@@ -25,49 +25,84 @@ VIEWS = [
     ("radar", "🎯 因子雷达图 Factor Radar"),
 ]
 
-if "report" not in st.session_state:
-    st.session_state.report = None
-if "view" not in st.session_state:
-    st.session_state.view = "overview"
-if "error" not in st.session_state:
-    st.session_state.error = None
+FREQ_LABELS = {key: tf["label"] for key, tf in report.TIMEFRAMES.items()}
+
+# (label, freq, lookback days, short MA, long MA). MAs are in bars: on a
+# two-month daily window only ~44 bars exist, so 5/20 is what fits; on
+# hourly bars 20/60 is roughly one and three weeks of trading.
+PRESETS = [
+    ("近两月·日线 2M daily", "daily", 61, 5, 20),
+    ("近两月·小时 2M hourly", "60m", 61, 20, 60),
+    ("一年半·日线 18M daily", "daily", 548, 20, 60),
+]
+
+for key, default in [("report", None), ("view", "overview"), ("error", None),
+                     ("run_now", False), ("freq", "daily"), ("days", 548),
+                     ("short_ma", 20), ("long_ma", 60)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
-def run_analysis(code, short_ma, long_ma):
+def apply_preset(freq, days, short, long):
+    """Runs before the rerun, so it may set widget values."""
+    st.session_state.freq = freq
+    st.session_state.days = days
+    st.session_state.short_ma = short
+    st.session_state.long_ma = long
+    st.session_state.run_now = True
+
+
+def run_analysis(code, freq, days, short_ma, long_ma):
     st.session_state.error = None
     try:
-        with st.spinner(f"Fetching & scoring {code} ... this pulls several "
-                        f"live AKShare endpoints, ~10-30s"):
+        with st.spinner(f"Fetching & scoring {code} on {FREQ_LABELS[freq]} bars, "
+                        f"{days}-day window ... several live AKShare endpoints, ~10-60s"):
             st.session_state.report = report.build_report(
-                code, short_ma=short_ma, long_ma=long_ma)
+                code, lookback_days=days, short_ma=short_ma, long_ma=long_ma,
+                freq=freq)
     except Exception as e:
         st.session_state.report = None
         st.session_state.error = str(e)
 
 
 # ---------------------------------------------------------------------------
-# Top bar: the one code box + Analyze + view buttons
+# Top bar: the one code box, timeframe/window, Analyze, presets
 # ---------------------------------------------------------------------------
 
 st.title("截面联动 Quant Dashboard")
 st.caption("Free AKShare data · cross-sectional-linkage-weighted multi-factor model · runs entirely on your machine")
 
-top = st.columns([3, 1, 1, 1])
+top = st.columns([3, 1.3, 1, 1, 1, 1.3])
 with top[0]:
     code_input = st.text_input("股票代码 Stock code", value="300274.SZ",
-                               label_visibility="visible",
                                placeholder="e.g. 300274.SZ, 600519.SH")
 with top[1]:
-    short_ma = st.number_input("短均线 Short MA", min_value=2, max_value=60, value=20)
+    st.selectbox("周期 Timeframe", options=list(FREQ_LABELS),
+                 format_func=FREQ_LABELS.get, key="freq")
 with top[2]:
-    long_ma = st.number_input("长均线 Long MA", min_value=5, max_value=250, value=60)
+    st.number_input("回看天数 Lookback (days)", min_value=20, max_value=1500, key="days")
 with top[3]:
+    st.number_input("短均线 Short MA", min_value=2, max_value=120, key="short_ma",
+                    help="In bars of the chosen timeframe.")
+with top[4]:
+    st.number_input("长均线 Long MA", min_value=5, max_value=250, key="long_ma",
+                    help="In bars of the chosen timeframe. Shrunk automatically "
+                         "if the window has too few bars.")
+with top[5]:
     st.write("")
     st.write("")
     analyze_clicked = st.button("🔍 生成报告 Analyze", type="primary", use_container_width=True)
 
-if analyze_clicked and code_input.strip():
-    run_analysis(code_input.strip(), short_ma, long_ma)
+presets = st.columns(len(PRESETS) + 2)
+presets[0].caption("快捷 Presets →")
+for i, (label, freq, days, short, long) in enumerate(PRESETS, start=1):
+    presets[i].button(label, use_container_width=True, on_click=apply_preset,
+                      args=(freq, days, short, long))
+
+if (analyze_clicked or st.session_state.run_now) and code_input.strip():
+    st.session_state.run_now = False
+    run_analysis(code_input.strip(), st.session_state.freq, int(st.session_state.days),
+                 int(st.session_state.short_ma), int(st.session_state.long_ma))
 
 if st.session_state.error:
     st.error(f"Failed to build report: {st.session_state.error}")
@@ -89,6 +124,9 @@ if r is not None:
     score_str = f"{r.composite_score:.1f}" if r.composite_score == r.composite_score else "n/a"
     header[2].metric("综合评分 Composite Score", f"{score_str} / 100")
     header[3].metric("信号 Stance", r.stance)
+    st.caption(f"**{FREQ_LABELS[r.freq]}** · window {r.start} → {r.end} · "
+               f"{len(r.prices)} bars · last bar {r.as_of} · "
+               f"MA{r.short_ma}/MA{r.long_ma} ({r.bar_unit} bars)")
 
     if r.warnings:
         with st.expander(f"⚠️ {len(r.warnings)} data warning(s)"):
@@ -147,27 +185,44 @@ if r is not None:
             st.warning("No price history available.")
         else:
             p = p.sort_values("date")
-            ma_s = p["close"].rolling(int(short_ma)).mean()
-            ma_l = p["close"].rolling(int(long_ma)).mean()
+            ma_s = p["close"].rolling(r.short_ma).mean()
+            ma_l = p["close"].rolling(r.long_ma).mean()
+            intraday = r.bar_unit != "day"
+            # Intraday bars on a time axis leave huge overnight/weekend gaps;
+            # a category axis puts consecutive bars side by side instead.
+            x = p["date"].dt.strftime("%m-%d %H:%M") if intraday else p["date"]
             fig = go.Figure()
             fig.add_trace(go.Candlestick(
-                x=p["date"], open=p["open"], high=p["high"],
+                x=x, open=p["open"], high=p["high"],
                 low=p["low"], close=p["close"], name=r.code,
             ))
-            fig.add_trace(go.Scatter(x=p["date"], y=ma_s, name=f"MA{short_ma}",
+            fig.add_trace(go.Scatter(x=x, y=ma_s, name=f"MA{r.short_ma}",
                                      line=dict(width=1.3, color="#F5A623")))
-            fig.add_trace(go.Scatter(x=p["date"], y=ma_l, name=f"MA{long_ma}",
+            fig.add_trace(go.Scatter(x=x, y=ma_l, name=f"MA{r.long_ma}",
                                      line=dict(width=1.3, color="#7B61FF")))
             fig.update_layout(height=520, xaxis_rangeslider_visible=False,
                               margin=dict(l=10, r=10, t=30, b=10),
                               legend=dict(orientation="h"))
+            if intraday:
+                fig.update_xaxes(type="category", nticks=12)
             st.plotly_chart(fig, use_container_width=True)
 
-            vol_fig = go.Figure(go.Bar(x=p["date"], y=p["volume"],
-                                       marker_color="#8892A0"))
+            vol_fig = go.Figure(go.Bar(x=x, y=p["volume"], marker_color="#8892A0"))
             vol_fig.update_layout(height=180, margin=dict(l=10, r=10, t=10, b=10),
                                   title="成交量 Volume")
+            if intraday:
+                vol_fig.update_xaxes(type="category", nticks=12)
             st.plotly_chart(vol_fig, use_container_width=True)
+
+            t = r.technical
+            w = st.columns(4)
+            def _pct(v):
+                return f"{v:+.2f}%" if v == v and v is not None else "n/a"
+            w[0].metric("区间涨跌 Window return", _pct(t.get("ret_window")))
+            w[1].metric("区间高点 Window high", f"{t.get('hi_window', float('nan')):.2f}")
+            w[2].metric("区间低点 Window low", f"{t.get('lo_window', float('nan')):.2f}")
+            w[3].metric("RSI14", f"{t.get('rsi14', float('nan')):.1f}",
+                        help=f"On {r.bar_unit} bars.")
 
             t = r.technical
             st.subheader("几何SDE分解 Geometric-SDE decomposition")
@@ -239,82 +294,109 @@ if r is not None:
                     "history missing for this code).")
 
     # -----------------------------------------------------------------
-    # Lead-lag network (DTW delay-aware layer)
+    # Lead-lag network (delay-aware layer, quant/leadlag.py)
     # -----------------------------------------------------------------
     elif view == "leadlag":
         link = r.linkage
         net = link.get("leadlag_network")
+        hourly = r.bar_unit == "hour"
+        unit, col = ("h", "lead_hours") if hourly else ("d", "lead_days")
         st.subheader("时滞联动 Lead-lag structure")
         st.caption(
-            "Two-stage DTW per peer: warp the price paths to read the "
-            "(fractional) day offset at which they align, then shift by that "
-            "offset and measure how alike the return paths are. "
-            "**Positive lead = that peer moves before this stock.** "
-            "`aligned_corr` is the correlation of the delay-aligned returns — "
-            "near zero means the pairing is noise, whatever the delay says."
+            f"Per peer: recency-weighted cross-correlation of returns finds the "
+            f"(fractional) lag at which the two move together; the peer is then "
+            f"shifted by that lag to measure trend similarity. Measured on "
+            f"**{FREQ_LABELS[r.freq]}** bars, so lags read in "
+            f"{'trading hours' if hourly else 'trading days'}. "
+            f"**Positive lead = that peer moves before this stock.** "
+            f"A peer only counts if its correlation clears a significance "
+            f"threshold that accounts for how many lags were searched — "
+            f"otherwise its 'lead' is noise."
         )
+
+        def _lead_fmt(key):
+            v = link.get(key, float("nan"))
+            if v != v:
+                return "n/a"
+            return (f"{link.get(key.replace('_days', '_hours')):+.1f}h"
+                    if hourly else f"{v:+.1f}d")
 
         m = st.columns(4)
         sig = link.get("leading_peer_signal_pct", float("nan"))
         m[0].metric("领先股信号 Leading-peer signal",
                     f"{sig:+.2f}%" if sig == sig else "n/a",
-                    help="Move the leading peers have already made that this "
-                         "stock has not yet followed. Positive = bullish pressure.")
-        m[1].metric("领先股数量 Leading peers",
-                    link.get("n_leading_peers", 0))
-        lead_days = link.get("leading_peer_mean_lead_days", float("nan"))
-        m[2].metric("平均领先天数 Mean lead",
-                    f"{lead_days:.1f}d" if lead_days == lead_days else "n/a")
+                    help="Move the linked leading peers have already made that "
+                         "this stock has not yet followed. Positive = bullish pressure.")
+        m[1].metric("显著联动 Linked peers",
+                    f"{link.get('n_linked_peers', 0)} / {link.get('n_peers_tested', 0)}",
+                    help="Peers whose lagged correlation passes significance.")
+        m[2].metric("领先股 Linked leaders", link.get("n_leading_peers", 0),
+                    delta=f"mean lead {_lead_fmt('leading_peer_mean_lead_days')}"
+                    if link.get("n_leading_peers") else None, delta_color="off")
         leadership = link.get("target_leadership_days", float("nan"))
         m[3].metric("本股地位 This stock's role",
-                    ("领先 Leader" if leadership > 0.5 else
-                     "滞后 Follower" if leadership < -0.5 else "同步 In-step")
+                    ("领先 Leader" if leadership > 0.5 / r.bars_per_day else
+                     "滞后 Follower" if leadership < -0.5 / r.bars_per_day else "同步 In-step")
                     if leadership == leadership else "n/a",
-                    delta=f"{leadership:+.1f}d vs peers" if leadership == leadership else None)
+                    delta=(f"{_lead_fmt('target_leadership_days')} vs linked peers"
+                           if leadership == leadership else None))
+
+        if r.freq == "daily" and len(r.prices) < 80:
+            st.warning(f"Only {len(r.prices)} daily bars in this window. On a sample "
+                       "this short few genuine links can reach significance — "
+                       "switch to 60分钟 Hourly for a usable lead-lag read.")
 
         if net is not None and not net.empty:
-            plot_df = net.sort_values("lead_days")
+            plot_df = net.sort_values(col)
+            linked = plot_df["linked"].astype(bool)
             fig = go.Figure(go.Bar(
-                x=plot_df["lead_days"], y=plot_df.index, orientation="h",
-                marker=dict(
-                    color=plot_df["aligned_corr"], colorscale="RdBu", cmid=0,
-                    cmin=-1, cmax=1, colorbar=dict(title="aligned<br>corr"),
-                ),
-                hovertemplate="%{y}<br>lead: %{x:.2f}d<br>corr: %{marker.color:.2f}<extra></extra>",
+                x=plot_df[col], y=plot_df.index, orientation="h",
+                marker=dict(color=plot_df["lag_corr"], colorscale="RdBu", cmid=0,
+                            cmin=-1, cmax=1, colorbar=dict(title="lag<br>corr"),
+                            opacity=[1.0 if v else 0.25 for v in linked]),
+                customdata=np.stack([plot_df["lag_corr"], plot_df["threshold"],
+                                     linked.map({True: "linked", False: "not significant"})], axis=1),
+                hovertemplate=("%{y}<br>lead: %{x:.2f}" + unit +
+                               "<br>corr: %{customdata[0]:.2f} (needs %{customdata[1]:.2f})"
+                               "<br>%{customdata[2]}<extra></extra>"),
             ))
             fig.add_vline(x=0, line_width=1, line_color="#555")
             fig.update_layout(
                 height=max(380, 30 * len(plot_df)),
                 margin=dict(l=10, r=10, t=30, b=10),
-                xaxis_title="← 滞后 lags this stock    |    领先 leads this stock →",
+                xaxis_title=f"← 滞后 lags this stock    |    领先 leads this stock →   ({unit})",
             )
             st.plotly_chart(fig, use_container_width=True)
+            st.caption("Faded bars did not pass significance and are ignored by the signal.")
 
             st.subheader("真实联动 vs 噪声 Real linkage vs noise")
-            st.caption("Peers cluster to the right of ~0.2 aligned correlation only "
-                      "when the lead-lag relationship is real; the rest is warping noise.")
-            scat = go.Figure(go.Scatter(
-                x=net["lead_days"], y=net["aligned_corr"], mode="markers+text",
-                text=[label.split()[0] for label in net.index],
-                textposition="top center",
-                marker=dict(size=11, color=net["trend_similarity"],
-                            colorscale="Viridis", showscale=True,
-                            colorbar=dict(title="DTW<br>similarity")),
-            ))
-            scat.add_hline(y=0.2, line_dash="dash", line_color="#888",
-                          annotation_text="signal inclusion threshold")
+            thr = float(net["threshold"].median())
+            scat = go.Figure()
+            for is_linked, name, color in [(True, "linked", "#2E86AB"),
+                                           (False, "not significant", "#B0B7C3")]:
+                part = net[net["linked"].astype(bool) == is_linked]
+                if part.empty:
+                    continue
+                scat.add_trace(go.Scatter(
+                    x=part[col], y=part["lag_corr"], mode="markers+text", name=name,
+                    text=[label.split()[0] for label in part.index],
+                    textposition="top center",
+                    marker=dict(size=11, color=color)))
+            scat.add_hline(y=thr, line_dash="dash", line_color="#888",
+                           annotation_text=f"significance threshold ≈ {thr:.2f}")
             scat.add_vline(x=0, line_width=1, line_color="#555")
             scat.update_layout(height=430, margin=dict(l=10, r=10, t=10, b=10),
-                              xaxis_title="lead_days (positive = peer leads)",
-                              yaxis_title="aligned return correlation")
+                               xaxis_title=f"lead ({unit}, positive = peer leads)",
+                               yaxis_title="peak lagged return correlation",
+                               legend=dict(orientation="h"))
             st.plotly_chart(scat, use_container_width=True)
 
             with st.expander("完整时滞表 Full lead-lag table"):
-                st.dataframe(net.sort_values("lead_days", ascending=False).round(3),
-                            use_container_width=True)
+                st.dataframe(net.sort_values(["linked", "lag_corr"], ascending=False).round(3),
+                             use_container_width=True)
         else:
             st.info("Lead-lag network unavailable — needs an industry peer list "
-                   "and at least 30 overlapping trading days per peer.")
+                    "and at least 30 overlapping bars per peer.")
 
     # -----------------------------------------------------------------
     # Capital flow

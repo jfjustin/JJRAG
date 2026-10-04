@@ -1,45 +1,69 @@
-"""Lead-lag (先导-滞后) estimation between stocks, via two-stage DTW.
+"""Lead-lag (先导-滞后) estimation between stocks.
 
-Implements the delay-aware correlation estimator from DGNSDE ("Delay-Aware
-Graph Neural Stochastic Differential Equations for Financial Time Series
-Modeling and Forecasting", WWW'26), minus the neural parts — the pieces
-that carry over to a factor model are the two-stage DTW and the
-fractional-day alignment:
+Follows the two-stage delay-aware estimator in DGNSDE ("Delay-Aware Graph
+Neural Stochastic Differential Equations for Financial Time Series
+Modeling and Forecasting", WWW'26), minus the neural parts — with one
+deliberate departure in stage 1, explained below.
 
-  Stage 1 — elastic alignment & delay measurement. DTW the two stocks'
-  standardized close-price series over a trailing window, walk the warping
-  path, and read the index offset (i - j) at each aligned point. Weight
-  those offsets by recency (alignment points nearer today count for more)
-  and average → the pair's mean lead-lag in days, which is generally
-  fractional.
+  Stage 1 — delay measurement. Recency-weighted cross-correlation of the
+  two stocks' log returns over integer lags within a range scaled to the
+  sample size, with the peak refined to a fractional lag by parabolic
+  interpolation. The paper instead DTW-aligns standardized price *levels*
+  and averages the warping path's offsets. Benchmarked against synthetic
+  peers with known lags and realistic noise, that level-DTW recovered only
+  10-21% of lags to within one bar and got the sign right about half the
+  time: a price level is dominated by each stock's own cumulative random
+  walk, so the warping chases idiosyncratic drift rather than the shared
+  factor. Cross-correlating returns (which are stationary) recovered 79-92%
+  to within one bar on the same data. Recency weighting is kept from the
+  paper — observations nearer today count for more.
 
-  Stage 2 — trend similarity after delay alignment. Shift the peer by that
-  (fractional) delay using a cubic Hermite spline, take the overlap,
-  log-difference both into slope (instantaneous-return) series, z-score
-  them so price level drops out, and run a second band-constrained DTW.
-  The normalized distance maps to [0, 1] — smaller means the two names
-  trace the same trend once the time offset is removed.
+  Stage 2 — trend similarity after delay alignment, as in the paper. Shift
+  the peer by the fractional delay through a monotone cubic Hermite (PCHIP)
+  spline, log-difference both into slope series, z-score them, and run a
+  band-constrained DTW; the normalized distance maps to [0, 1].
 
-Sign convention, used everywhere below: **lead_days > 0 means the PEER
-LEADS the TARGET** by that many trading days (the peer moves first, the
-target follows). Negative means the target leads the peer.
+Significance gating. Picking the best of ~2L+1 lags inflates the winning
+correlation even for pure noise, so a fixed cutoff lets noise peers in. A
+pair counts as `linked` only when its peak correlation clears a
+family-wise threshold at alpha=0.10 over the lags searched, using the
+effective sample size left after recency weighting. On the benchmark that
+admitted 3-5% of unrelated peers while detecting 100% of real links on
+~6 months of daily bars, 54% on two months of hourly bars, and only 27% on
+two months of daily bars — 44 daily bars simply can't establish lead-lag
+reliably, which is the case for using intraday bars on short windows.
 
-Complexity note: DTW is O(n*m) with a sequential inner recurrence, so it
-stays a Python loop. At the default 120-day window that's ~14k cell
-updates per pair — a few milliseconds — but it's why the peer set is
-capped rather than run against a whole index.
+Sign convention: **lead_days > 0 means the PEER LEADS the TARGET** (the
+peer moves first, the target follows). Negative means the target leads.
+
+Units: every offset is in *bars of the input series* — days on daily bars,
+trading hours on 60-minute bars. Callers on intraday bars convert for
+display (see report._convert_lead_units).
 """
 
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
+from scipy.stats import norm
 
 DEFAULT_WINDOW = 120
-DEFAULT_DECAY = 3.0
+# Exponential recency decay across the window: weight runs from e^-DECAY on
+# the oldest observation to 1 on the newest. 1.0 balanced recency against
+# effective sample size best on the benchmark; at 3.0 the shrunken sample
+# made genuine links fail significance.
+DEFAULT_DECAY = 1.0
 DEFAULT_BAND = 5
+DEFAULT_ALPHA = 0.10
 # Real lead-lag transmission runs hours to a few days; past this a large
-# estimate is a warping artifact, not information flow.
+# estimate is noise, not information flow.
 MAX_LEAD_DAYS = 10.0
+# Small per-bar penalty so a near-tie between a short and a long lag goes
+# to the short one — long lags are where spurious peaks live.
+LAG_PENALTY = 0.01
+
+NETWORK_COLUMNS = ["lead_days", "lag_corr", "threshold", "linked",
+                   "aligned_corr", "trend_similarity", "trend_distance",
+                   "overlap"]
 
 
 def _zscore(a):
@@ -48,6 +72,28 @@ def _zscore(a):
     if sd == 0 or not np.isfinite(sd):
         return np.zeros_like(a)
     return (a - np.mean(a)) / sd
+
+
+def _recency_weights(n, decay):
+    return np.exp(-decay * (1.0 - np.arange(n) / max(n - 1, 1)))
+
+
+def _weighted_corr(a, b, w):
+    w = w / w.sum()
+    ma, mb = np.sum(w * a), np.sum(w * b)
+    va, vb = np.sum(w * (a - ma) ** 2), np.sum(w * (b - mb) ** 2)
+    if va <= 0 or vb <= 0:
+        return float("nan")
+    return float(np.sum(w * (a - ma) * (b - mb)) / np.sqrt(va * vb))
+
+
+def _lagged(target_ret, peer_ret, k):
+    """Pair target[t] with peer[t-k]: k > 0 tests 'peer leads by k'."""
+    if k > 0:
+        return target_ret[k:], peer_ret[:-k]
+    if k < 0:
+        return target_ret[:k], peer_ret[-k:]
+    return target_ret, peer_ret
 
 
 def dtw(x, y, band=None):
@@ -69,7 +115,6 @@ def dtw(x, y, band=None):
         if band is None:
             j_lo, j_hi = 1, m
         else:
-            # Keep the band proportional when the two series differ in length.
             centre = int(round(i * m / n))
             j_lo = max(1, centre - band)
             j_hi = min(m, centre + band)
@@ -81,7 +126,6 @@ def dtw(x, y, band=None):
     if not np.isfinite(cost[n, m]):
         return float("inf"), []
 
-    # Backtrack the warping path.
     path = []
     i, j = n, m
     while i > 0 and j > 0:
@@ -100,7 +144,7 @@ def dtw(x, y, band=None):
 def hermite_sample(values, positions):
     """Evaluate a series at fractional index positions via a monotone cubic
     Hermite (PCHIP) spline — the interpolation DGNSDE uses to read a
-    neighbour's state at a fractional-day offset. Out-of-range positions
+    neighbour's state at a fractional-bar offset. Out-of-range positions
     are clamped to the series' ends."""
     values = np.asarray(values, dtype=float)
     n = len(values)
@@ -129,177 +173,175 @@ def continuous_path(dates, values, freq="D"):
     return grid, spline(grid_pos)
 
 
+def lag_search_range(n_returns, max_lead=MAX_LEAD_DAYS):
+    """Lags searched scale with the sample: scanning +/-10 lags on 40
+    returns mostly finds noise peaks."""
+    return int(min(max_lead, max(2, n_returns // 8)))
+
+
 def estimate_lead_lag(target_close, peer_close, window=DEFAULT_WINDOW,
                       decay=DEFAULT_DECAY, band=DEFAULT_BAND,
-                      max_lead=MAX_LEAD_DAYS):
-    """Two-stage DTW lead-lag estimate for one target/peer pair.
+                      max_lead=MAX_LEAD_DAYS, alpha=DEFAULT_ALPHA):
+    """Lead-lag estimate for one target/peer pair.
 
     `target_close` and `peer_close` must already be aligned to a common set
-    of trading dates (same length, same calendar). Returns a dict with
-    lead_days (>0 = peer leads target), trend_distance in [0, 1] (smaller =
-    same trend once shifted), trend_similarity = 1 - trend_distance,
-    aligned_corr, and the raw stage-1 DTW distance — or None if there isn't
-    enough overlap.
+    of bars. Returns a dict, or None if there isn't enough overlap:
 
-    Two guards against reading structure into noise. The delay is clamped
-    to +/-`max_lead` days, since real information transmission runs hours
-    to a few days and anything larger is a warping artifact. And
-    `aligned_corr` — plain Pearson correlation of the delay-aligned slope
-    series — is reported alongside the DTW-derived similarity because it is
-    the better-calibrated of the two: it sits near 0 for unrelated names,
-    whereas the DTW distance map stays middling. Weight by aligned_corr
-    when you need noise peers to fall out on their own.
+    - lead_days: fractional lag in bars, >0 = peer leads target
+    - lag_corr: recency-weighted return correlation at the peak lag
+    - threshold, linked: significance cutoff for lag_corr and whether the
+      pair clears it (see module docstring)
+    - aligned_corr: plain correlation of returns after the fractional shift
+    - trend_similarity / trend_distance: the paper's stage-2 DTW measure
     """
     t = np.asarray(target_close, dtype=float)
     p = np.asarray(peer_close, dtype=float)
-    n = min(len(t), len(p))
+    n = min(len(t), len(p), window)
     if n < 30:
         return None
-    t, p = t[-min(n, window):], p[-min(n, window):]
-    if not (np.isfinite(t).all() and np.isfinite(p).all()):
+    t, p = t[-n:], p[-n:]
+    if not (np.isfinite(t).all() and np.isfinite(p).all()) or (t <= 0).any() or (p <= 0).any():
         return None
 
-    # --- Stage 1: elastic alignment, recency-weighted delay -------------
-    dist, path = dtw(_zscore(t), _zscore(p))
-    if not path:
+    # --- Stage 1: weighted cross-correlation over a sample-scaled range ---
+    t_ret, p_ret = np.diff(np.log(t)), np.diff(np.log(p))
+    span = lag_search_range(len(t_ret), max_lead)
+    lags = np.arange(-span, span + 1)
+    cc = np.array([_weighted_corr(*_lagged(t_ret, p_ret, k),
+                                  _recency_weights(len(t_ret) - abs(k), decay))
+                   for k in lags])
+    if not np.isfinite(cc).any():
         return None
-    idx = np.array(path, dtype=float)          # columns: target i, peer j
-    offsets = idx[:, 0] - idx[:, 1]            # >0 => peer leads target
-    recency = idx[:, 0] / max(len(t) - 1, 1)   # 0 = oldest, 1 = today
-    weights = np.exp(-decay * (1.0 - recency))
-    lead_days = float(np.sum(weights * offsets) / np.sum(weights))
-    lead_days = float(np.clip(lead_days, -max_lead, max_lead))
+    i = int(np.nanargmax(np.where(np.isfinite(cc), cc - LAG_PENALTY * np.abs(lags), -np.inf)))
+    frac = 0.0
+    if 0 < i < len(cc) - 1 and np.isfinite(cc[i - 1:i + 2]).all():
+        y0, y1, y2 = cc[i - 1], cc[i], cc[i + 1]
+        curvature = y0 - 2 * y1 + y2
+        if curvature < 0:
+            frac = float(np.clip(0.5 * (y0 - y2) / curvature, -0.5, 0.5))
+    lead_days = float(lags[i] + frac)
+    lag_corr = float(cc[i])
 
-    # --- Stage 2: similarity of the delay-aligned slope series ----------
-    # Shift the peer forward by lead_days so its move lines up with the
-    # target's; fractional shifts are read off the Hermite spline.
-    positions = np.arange(len(p)) - lead_days
-    peer_shifted = hermite_sample(p, positions)
-    valid = np.isfinite(peer_shifted) & np.isfinite(t)
-    trend_distance = float("nan")
-    aligned_corr = float("nan")
+    w = _recency_weights(len(t_ret) - abs(int(lags[i])), decay)
+    n_eff = w.sum() ** 2 / (w ** 2).sum()
+    threshold = float(norm.ppf(1 - alpha / (2 * len(lags))) / np.sqrt(max(n_eff - 3, 1)))
+
+    # --- Stage 2: similarity of the delay-aligned slope series -----------
+    peer_shifted = hermite_sample(p, np.arange(len(p)) - lead_days)
+    valid = np.isfinite(peer_shifted) & (peer_shifted > 0)
+    trend_distance = aligned_corr = float("nan")
     if valid.sum() >= 20:
-        t_ov, p_ov = t[valid], peer_shifted[valid]
-        if (t_ov > 0).all() and (p_ov > 0).all():
-            t_slope = np.diff(np.log(t_ov))
-            p_slope = np.diff(np.log(p_ov))
-            if len(t_slope) >= 10:
-                d2, path2 = dtw(_zscore(t_slope), _zscore(p_slope), band=band)
-                if path2 and np.isfinite(d2):
-                    # Per-aligned-point cost in sigma units -> [0, 1].
-                    mean_cost = d2 / len(path2)
-                    trend_distance = float(1.0 - np.exp(-mean_cost))
-                if np.std(t_slope) > 0 and np.std(p_slope) > 0:
-                    aligned_corr = float(np.corrcoef(t_slope, p_slope)[0, 1])
+        t_slope = np.diff(np.log(t[valid]))
+        p_slope = np.diff(np.log(peer_shifted[valid]))
+        d2, path2 = dtw(_zscore(t_slope), _zscore(p_slope), band=band)
+        if path2 and np.isfinite(d2):
+            trend_distance = float(1.0 - np.exp(-d2 / len(path2)))
+        if np.std(t_slope) > 0 and np.std(p_slope) > 0:
+            aligned_corr = float(np.corrcoef(t_slope, p_slope)[0, 1])
 
     return {
         "lead_days": lead_days,
-        "dtw_distance": dist,
+        "lag_corr": lag_corr,
+        "threshold": threshold,
+        "linked": bool(lag_corr >= threshold),
+        "aligned_corr": aligned_corr,
         "trend_distance": trend_distance,
         "trend_similarity": (1.0 - trend_distance
-                            if np.isfinite(trend_distance) else float("nan")),
-        "aligned_corr": aligned_corr,
+                             if np.isfinite(trend_distance) else float("nan")),
     }
 
 
 def build_leadlag_network(target_close, peer_closes, window=DEFAULT_WINDOW,
-                          decay=DEFAULT_DECAY, band=DEFAULT_BAND):
+                          decay=DEFAULT_DECAY, band=DEFAULT_BAND,
+                          max_lead=MAX_LEAD_DAYS, alpha=DEFAULT_ALPHA):
     """Run estimate_lead_lag over a dict of {peer_label: close Series}.
 
-    Every series is inner-joined to the target's dates first, so trading
-    halts on either side simply shorten the overlap instead of skewing the
-    alignment. Returns a DataFrame indexed by peer label with columns
-    lead_days, trend_similarity, trend_distance, dtw_distance, overlap.
+    Every series is inner-joined to the target's timestamps first, so a
+    trading halt on either side shortens the overlap instead of skewing the
+    alignment. Returns a DataFrame indexed by peer label (NETWORK_COLUMNS).
     """
     rows = {}
     target = pd.Series(target_close).dropna()
     for label, peer in peer_closes.items():
         peer = pd.Series(peer).dropna()
         joined = pd.concat([target.rename("t"), peer.rename("p")],
-                          axis=1, join="inner").dropna()
+                           axis=1, join="inner").dropna()
         if len(joined) < 30:
             continue
         est = estimate_lead_lag(joined["t"].values, joined["p"].values,
-                                window=window, decay=decay, band=band)
+                                window=window, decay=decay, band=band,
+                                max_lead=max_lead, alpha=alpha)
         if est is None:
             continue
-        est["overlap"] = len(joined)
+        est["overlap"] = min(len(joined), window)
         rows[label] = est
     if not rows:
-        return pd.DataFrame(columns=["lead_days", "dtw_distance",
-                                     "trend_distance", "trend_similarity",
-                                     "aligned_corr", "overlap"])
-    return pd.DataFrame.from_dict(rows, orient="index")
+        return pd.DataFrame(columns=NETWORK_COLUMNS)
+    return pd.DataFrame.from_dict(rows, orient="index")[NETWORK_COLUMNS]
 
 
-def leading_peer_signal(network, peer_closes, min_lead=0.5, min_corr=0.2):
+def leading_peer_signal(network, peer_closes, min_lead=0.5):
     """The tradeable distillation of DGNSDE's time-aligned aggregation.
 
-    For every peer that *leads* the target by at least `min_lead` days,
-    read the move that peer has already made over exactly that (fractional)
-    lead window — the move the target has not yet made — and average those
-    across peers, weighted by delay-aligned co-movement.
+    For every *linked* peer that leads the target by at least `min_lead`
+    bars, read the move that peer has already made over exactly its
+    (fractional) lead window — the move the target has not yet made — and
+    average across peers weighted by lag correlation.
 
-    Weighting uses `aligned_corr` rather than the DTW `trend_similarity`:
-    an unrelated peer lands near 0 and drops out of the average on its own,
-    while the DTW map would still hand it a middling weight. `min_corr`
-    additionally excludes peers whose aligned returns barely co-move at all.
-
-    Positive = leading peers have risen and the target hasn't followed yet
-    (bullish pressure); negative = the reverse. Returns a dict with the
-    signal in percent, how many peers fed it, and their mean lead.
+    Positive = linked leaders have risen and the target hasn't followed yet
+    (bullish pressure); negative = the reverse.
     """
     empty = {"leading_peer_signal_pct": float("nan"), "n_leading_peers": 0}
     if network is None or network.empty:
         return {}
-    leaders = network[(network["lead_days"] >= min_lead)
-                     & (network["aligned_corr"].fillna(0) >= min_corr)]
+    leaders = network[network["linked"].astype(bool)
+                      & (network["lead_days"] >= min_lead)]
     if leaders.empty:
         return empty
 
-    contributions, weights = [], []
+    contributions, weights, leads = [], [], []
     for label, row in leaders.iterrows():
         closes = pd.Series(peer_closes.get(label)).dropna()
         if len(closes) < 5:
             continue
         lead = float(row["lead_days"])
-        last_idx = len(closes) - 1
-        past = hermite_sample(closes.values, [last_idx - lead])[0]
+        past = hermite_sample(closes.values, [len(closes) - 1 - lead])[0]
         if not np.isfinite(past) or past <= 0:
             continue
-        move_pct = (closes.values[-1] / past - 1.0) * 100.0
-        w = float(row["aligned_corr"])
-        if not np.isfinite(w) or w <= 0:
-            continue
-        contributions.append(move_pct * w)
+        w = float(row["lag_corr"])
+        contributions.append((closes.values[-1] / past - 1.0) * 100.0 * w)
         weights.append(w)
+        leads.append(lead)
 
     if not contributions:
         return empty
     return {
         "leading_peer_signal_pct": float(np.sum(contributions) / np.sum(weights)),
         "n_leading_peers": int(len(contributions)),
-        "leading_peer_mean_lead_days": float(leaders["lead_days"].mean()),
+        "leading_peer_mean_lead_days": float(np.mean(leads)),
     }
 
 
 def network_summary(network):
-    """Where the stock sits in its sector's information flow."""
+    """Where the stock sits in its sector's information flow, measured on
+    linked peers only — an unlinked peer's 'lead' is noise."""
     if network is None or network.empty:
         return {}
-    lead = network["lead_days"].dropna()
-    sim = network["trend_similarity"].dropna()
-    corr = network["aligned_corr"].dropna() if "aligned_corr" in network else pd.Series(dtype=float)
-    if lead.empty:
-        return {}
-    return {
-        "peer_mean_aligned_corr": float(corr.mean()) if not corr.empty else float("nan"),
-        # >0 => peers lead this stock on average, i.e. it is a follower.
+    linked = network[network["linked"].astype(bool)]
+    out = {
+        "n_peers_tested": int(len(network)),
+        "n_linked_peers": int(len(linked)),
+        "peer_mean_lag_corr": float(network["lag_corr"].mean()),
+        "peer_mean_trend_similarity": float(network["trend_similarity"].mean()),
+    }
+    if linked.empty:
+        return out
+    lead = linked["lead_days"]
+    out.update({
+        # >0 => linked peers lead this stock on average, i.e. it follows.
         "peer_mean_lead_days": float(lead.mean()),
-        # Flip the sign for the more intuitive reading.
         "target_leadership_days": float(-lead.mean()),
-        "n_leading_peers": int((lead >= 0.5).sum()),
         "n_lagging_peers": int((lead <= -0.5).sum()),
         "leadlag_abs_days": float(lead.abs().mean()),
-        "peer_mean_trend_similarity": float(sim.mean()) if not sim.empty else float("nan"),
-    }
+    })
+    return out

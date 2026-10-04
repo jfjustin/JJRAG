@@ -35,6 +35,40 @@ nothing re-hits the network until you click Analyze again.
 Prefer a terminal? `python -m quant.cli 300274.SZ` prints the same report
 as text, no Streamlit needed.
 
+### Timeframes and narrow windows
+
+The **周期 Timeframe** selector switches between daily bars and 60-minute
+bars (A-share hourly bars close at 10:30, 11:30, 14:00 and 15:00 — four per
+session), and **回看天数 Lookback** sets the window in calendar days. The
+preset buttons set both in one click:
+
+| Preset | Timeframe | Window | MAs (bars) |
+| --- | --- | --- | --- |
+| 近两月·日线 2M daily | daily | 61 days (~44 bars) | 5 / 20 |
+| 近两月·小时 2M hourly | 60-minute | 61 days (~170 bars) | 20 / 60 |
+| 一年半·日线 18M daily | daily | 548 days | 20 / 60 |
+
+Same from the terminal — `--freq both` runs daily then hourly:
+
+```bash
+python -m quant.cli 300476.SZ --days 61 --freq both
+```
+
+On hourly bars every bar-based measure is an hourly measure (MAs, RSI,
+MACD, betas against the CSI 300 and industry-board minute bars), lead-lag
+reads in **trading hours**, and volatility/SDE figures are annualized on
+four bars a day so they stay comparable with the daily run. Factors that
+need more history than the window holds (3/6/12-month returns, 12-1
+momentum, 52-week range) come back n/a rather than being silently computed
+over the shorter window; the window's own return and range are reported
+instead. Money-flow data is only published daily, so it is cut to the same
+window whichever timeframe you pick.
+
+**Use the hourly run for lead-lag on a short window.** Two months of daily
+bars is ~44 observations, and on the benchmark below only 27% of genuine
+links could be detected at a controlled false-positive rate on a sample
+that short (54% on two months of hourly bars).
+
 ## Why AKShare, not EastMoney's API directly / not EMQuantAPI
 
 [AKShare](https://github.com/akfamily/akshare) is the highest-starred,
@@ -68,7 +102,7 @@ What carries over to a factor model, and what doesn't:
 
 | DGNSDE component | Here |
 | --- | --- |
-| Two-stage DTW delay-aware correlation estimator | **Implemented** — `quant/leadlag.py` |
+| Two-stage delay-aware correlation estimator | **Stage 2 implemented as specified; stage 1 replaced** after it failed a known-lag benchmark — see below |
 | Fractional-day alignment via cubic Hermite interpolation | **Implemented** — `hermite_sample`, used for both the delay shift and reading a leader's past state |
 | Continuous control path via cubic spline (handles halts/irregular sampling) | **Implemented** — `continuous_path` |
 | Geometric SDE drift/diffusion decomposition | **Implemented classically** — `factors.sde_factors` fits GBM by moments; the paper's μ and σ are neural, these are estimated on the realized path |
@@ -82,12 +116,25 @@ dashboard produces.
 
 ### The lead-lag layer (`quant/leadlag.py`)
 
-**Stage 1 — elastic alignment and delay measurement.** DTW the target's
-and the peer's standardized close-price series over a trailing 120-day
-window, walk the warping path, and read the index offset `i - j` at each
-aligned point. Weight those offsets by recency (exponential decay, so
-alignments nearer today dominate) and average → the pair's mean lead-lag,
-generally a fractional number of days.
+**Stage 1 — delay measurement (departs from the paper).** The paper
+DTW-aligns the two stocks' standardized price *levels* and averages the
+warping path's offsets. This project originally did the same, and it
+failed a benchmark built for the purpose: 52 synthetic peers with known
+lags of -3 to +3 bars sharing a sector factor, with idiosyncratic noise at
+realistic levels (true-lag return correlation 0.25-0.39).
+
+| Stage-1 estimator | 6 months daily | 2 months daily | 2 months hourly |
+| --- | --- | --- | --- |
+| DTW on price levels (paper) | 21% within ±1 bar | 19% | 10% |
+| Weighted return cross-correlation (used) | 92% | 79% | 88% |
+
+A price level is dominated by each stock's own cumulative random walk, so
+level-DTW warps to match idiosyncratic drift rather than the shared factor;
+its sign was right about as often as a coin flip. The replacement is
+recency-weighted cross-correlation of log returns (stationary, so the
+shared factor is visible) over integer lags within a range scaled to the
+sample size, with the peak refined to a fractional lag by parabolic
+interpolation. Recency weighting is kept from the paper.
 
 **Stage 2 — trend similarity after delay alignment.** Shift the peer by
 that fractional delay through a monotone cubic Hermite (PCHIP) spline, take
@@ -98,23 +145,32 @@ trend once the offset is removed.
 
 **Sign convention:** `lead_days > 0` means the **peer leads the target**.
 
-**Two guards against reading structure into noise**, both added after
-testing showed unrelated random walks producing confident-looking delays:
+**Significance gating.** Picking the best of 2L+1 lags inflates the
+winning correlation even for pure noise, so a fixed cutoff lets unrelated
+peers in. A peer counts as `linked` only when its peak correlation clears a
+family-wise threshold (α = 0.10 across the lags searched), computed on the
+effective sample size left after recency weighting. Only linked peers feed
+the signal and the leader/follower summary. Tuned on the same benchmark
+plus 100 unrelated peers:
 
-- Delays are clamped to ±10 days. Real transmission runs hours to days;
-  a larger estimate is a warping artifact.
-- Alongside the paper's DTW-derived similarity, each pair also gets
-  `aligned_corr` — plain Pearson correlation of the delay-aligned returns.
-  It is the better-calibrated of the two (unrelated names land near 0,
-  where the DTW distance map still returns a middling ~0.6), so it is what
-  weights the signal and gates inclusion at 0.2. The dashboard's lead-lag
-  scatter plots exactly this separation.
+| Window | Real links detected | Noise peers admitted |
+| --- | --- | --- |
+| 6 months daily | 100% | 5% |
+| 2 months daily | 27% | 3% |
+| 2 months hourly | 54% | 3% |
 
-**The signal.** For every peer leading by ≥0.5 days with aligned
-correlation ≥0.2, read the move that peer has already made over exactly
-its (fractional) lead window — the move this stock has not yet followed —
-and average across peers weighted by aligned correlation. Positive means
-leaders have risen and this stock hasn't caught up.
+Lag search is capped at ±10 days on daily bars and ±16 hours on hourly
+bars, and further limited to about one-eighth of the sample.
+
+**The signal.** For every linked peer leading by at least half a bar, read
+the move that peer has already made over exactly its (fractional) lead
+window — the move this stock has not yet followed — and average across
+peers weighted by lag correlation. Positive means leaders have risen and
+this stock hasn't caught up.
+
+These benchmark figures come from synthetic data with a known answer; they
+show the estimator can recover a lag when one exists at this noise level,
+not how often real stocks have exploitable ones.
 
 ## Model design
 
@@ -202,7 +258,11 @@ AKShare has no test/sandbox mode — it's live scrapers of public endpoints.
 `python -m quant.selftest` mocks every AKShare call with synthetic data
 shaped like the real schemas and runs the full pipeline end to end
 (data → factors → composite score), so you can sanity-check the install
-without hitting the network or waiting on rate limits.
+without hitting the network or waiting on rate limits. It runs three
+scenarios — 18-month daily, two-month daily, two-month hourly — and checks,
+among other things, that linked peers' lags come out within one bar of the
+lags the synthetic universe was built with, and that long-horizon factors
+are n/a on a two-month window.
 
 ## Known limitations
 
@@ -220,10 +280,10 @@ without hitting the network or waiting on rate limits.
   ablation, not a fitted or backtested result for this scoring model. Tune
   `CATEGORY_WEIGHTS` and the per-factor scoring bands in `quant/model.py`
   for your own view.
-- **Lead-lag estimates shrink toward zero for larger true lags.** Testing
-  on synthetic shifted series recovers +1d as ~1.05, +2d as ~1.9, +3d as
-  ~2.7, but +5d as only ~3.6 — recency-weighted path averaging compresses
-  longer offsets. Directionally reliable, not a precise delay measurement.
+- **Lead-lag resolution is one bar.** The fractional refinement is a
+  parabolic fit to the correlation peak, good to roughly ±1 bar on the
+  benchmark. On daily bars that is ±1 day; use hourly bars when the
+  question is "a few hours or a day?".
 - **No RankIC/ICIR validation is included.** Measuring it properly needs
   point-in-time factor recomputation across a universe and many rebalance
   dates — every factor here is computed as-of-now only. Without that, the
