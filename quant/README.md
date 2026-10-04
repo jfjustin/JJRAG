@@ -1,14 +1,12 @@
 # Quant dashboard — cross-sectional multi-factor equity model
 
-A local Streamlit dashboard for analyzing individual China A-share stocks,
-built on **AKShare** — a free, open-source, credential-free market-data
-library — with a multi-factor model that leans heavily on **cross-sectional
-linkage (截面联动类)** factors: how a stock moves *relative to its peers*
-at each point in time, not just its own price history in isolation.
+A local Streamlit dashboard for analyzing individual China A-share stocks
+on daily, 60-, 30- and 15-minute bars, with a multi-factor model that leans
+on **cross-sectional linkage (截面联动类)** factors: how a stock moves
+*relative to its peers*, and which peers move *before* it.
 
-This replaces an earlier version of this project (`emquant/`) that depended
-on the paid East Money Choice **EMQuantAPI** SDK and a login. That's gone —
-everything here runs with zero account, zero API key, zero cost.
+All data comes from free sources that need no account and no API key, and
+none of it goes through East Money (see [Data sources](#data-sources)).
 
 ## Quick start
 
@@ -17,77 +15,97 @@ pip install -r requirements.txt
 streamlit run dashboard.py
 ```
 
-Type a code (e.g. `300274.SZ`, `600519.SH`) into the box, click **生成报告
-Analyze**, then switch between the view buttons:
+Type a code (e.g. `300476.SZ`, `600519.SH`) into the box, pick a preset or
+set the timeframe and lookback yourself, click **生成报告 Analyze**, then
+switch between the view buttons:
 
 | View | Shows |
 | --- | --- |
 | 综合评分 Overview | Composite score, category bars, snapshot, full factor detail |
-| K线走势 Price Chart | Candlestick + moving averages, volume, geometric-SDE drift/diffusion |
+| K线走势 Price Chart | Candlestick + moving averages, volume, window range, geometric-SDE drift/diffusion |
 | 截面联动分析 Cross-Sectional Linkage | Market/industry beta, percentile ranks, same-day peer correlation heatmap |
 | 时滞联动 Lead-Lag Network | Who leads this stock and by how long, the leading-peer signal, and a real-linkage-vs-noise scatter |
-| 资金流向 Capital Flow | Daily and cumulative main-fund inflow, northbound, margin |
+| 资金流向 Capital Flow | THS net inflow over 3/5/10/20 sessions and its industry/market rank, the industry's 5-day inflow league, a bar-direction flow estimate, margin balance |
 | 因子雷达图 Factor Radar | The five category scores as a radar chart |
 
-Every button click re-renders from data already fetched for that run —
+Every button click re-renders from data already fetched for that run;
 nothing re-hits the network until you click Analyze again.
 
-Prefer a terminal? `python -m quant.cli 300274.SZ` prints the same report
-as text, no Streamlit needed.
+From a terminal, `python -m quant.cli 300476.SZ` prints the same report as
+text, no Streamlit needed.
 
 ### Timeframes and narrow windows
 
-The **周期 Timeframe** selector switches between daily bars and 60-minute
-bars (A-share hourly bars close at 10:30, 11:30, 14:00 and 15:00 — four per
-session), and **回看天数 Lookback** sets the window in calendar days. The
-preset buttons set both in one click:
+| Preset | Timeframe | Window | Bars | MAs (bars) |
+| --- | --- | --- | --- | --- |
+| 近两月·日线 2M daily | daily | 61 days | ~44 | 5 / 20 |
+| 近两月·60分 2M 60m | 60-minute | 61 days | ~176 | 20 / 60 |
+| 近两月·30分 2M 30m | 30-minute | 61 days | ~352 | 20 / 60 |
+| 近两月·15分 2M 15m | 15-minute | 61 days | ~704 | 20 / 60 |
+| 一年半·日线 18M daily | daily | 548 days | ~370 | 20 / 60 |
 
-| Preset | Timeframe | Window | MAs (bars) |
-| --- | --- | --- | --- |
-| 近两月·日线 2M daily | daily | 61 days (~44 bars) | 5 / 20 |
-| 近两月·小时 2M hourly | 60-minute | 61 days (~170 bars) | 20 / 60 |
-| 一年半·日线 18M daily | daily | 548 days | 20 / 60 |
-
-Same from the terminal — `--freq both` runs daily then hourly:
+A-share sessions run four hours, so a day is 4 hourly, 8 half-hour or 16
+quarter-hour bars. From the terminal, `--freq` takes a comma list or `all`:
 
 ```bash
-python -m quant.cli 300476.SZ --days 61 --freq both
+python -m quant.cli 300476.SZ --days 61 --freq all        # daily, 60m, 30m, 15m
+python -m quant.cli 300476.SZ --days 61 --freq daily,15m
 ```
 
-On hourly bars every bar-based measure is an hourly measure (MAs, RSI,
-MACD, betas against the CSI 300 and industry-board minute bars), lead-lag
+On intraday bars every bar-based measure is computed at that timeframe
+(MAs, RSI, MACD, betas against CSI 300 and industry minute bars), lead-lag
 reads in **trading hours**, and volatility/SDE figures are annualized on
-four bars a day so they stay comparable with the daily run. Factors that
-need more history than the window holds (3/6/12-month returns, 12-1
-momentum, 52-week range) come back n/a rather than being silently computed
-over the shorter window; the window's own return and range are reported
-instead. Money-flow data is only published daily, so it is cut to the same
-window whichever timeframe you pick.
+the right number of bars per day so they stay comparable with the daily
+run. Factors that need more history than the window holds (3/6/12-month
+returns, 12-1 momentum, 52-week range) come back n/a rather than being
+silently computed over the shorter window; the window's own return and
+range are reported instead.
 
-**Use the hourly run for lead-lag on a short window.** Two months of daily
-bars is ~44 observations, and on the benchmark below only 27% of genuine
-links could be detected at a controlled false-positive rate on a sample
-that short (54% on two months of hourly bars).
+**Use an intraday run for lead-lag on a short window.** Two months of daily
+bars is ~44 observations; on the benchmark below only 27% of genuine links
+could be detected at a controlled false-positive rate on a sample that
+short, against 54% on two months of hourly bars. At 15 and 30 minutes the
+sample is larger still, at the cost of shorter-horizon, noisier bars.
 
-## Why AKShare, not EastMoney's API directly / not EMQuantAPI
+## Data sources
 
-[AKShare](https://github.com/akfamily/akshare) is the highest-starred,
-most actively maintained open-source China-market data library, and the
-most comprehensive free option available: A-share/HK/US quotes, index and
-industry/concept board data, fundamentals, capital-flow, Stock-Connect
-(northbound) holdings, margin trading, and more, aggregated from multiple
-public sources (East Money's public data center, Sina, 同花顺, and the
-exchanges directly) behind one consistent API. No account, no login, no
-paid Choice/EMQuantAPI subscription.
+| Data | Source | Notes |
+| --- | --- | --- |
+| Daily bars, PE (TTM), PB, turnover | **BaoStock** (证券宝) | Forward-adjusted; suspended sessions dropped |
+| 15/30/60-minute bars | **BaoStock** | History back years; end-of-day updates |
+| CSI 300 daily | **BaoStock** | |
+| CSI 300 minute bars | **Sina Finance** | BaoStock serves no index minute bars; Sina returns the latest ~1,970 bars (≈4 months of 15-minute) |
+| CSRC industry for every stock | **BaoStock** | One call; defines the peer universe |
+| Whole-market cross-section | **BaoStock** per-date query | Newer BaoStock releases only — see fallback below |
+| Profitability & growth | **BaoStock** quarterly | ROE annualized from year-to-date; revenue YoY vs the same quarter a year earlier |
+| Money flow (3/5/10/20 sessions) | **同花顺 THS** | Whole-market rankings |
+| Margin balance | **SSE / SZSE** | The exchanges' own daily detail files |
 
-One honest caveat: a number of AKShare's A-share endpoints do, under the
-hood, call East Money's own *public, unauthenticated* JSON data-center
-endpoints (as one of several backends it wraps) — that's simply where a lot
-of free, comprehensive Chinese market data lives. This is unrelated to, and
-far lighter-weight than, the paid EMQuantAPI/Choice terminal product this
-project used previously: no account, no credentials, no cost, and the
-dependency lives in one file (`quant/data.py`) if you ever want to swap a
-specific endpoint for a different backend.
+**Why BaoStock as the primary source.** It is free with an anonymous login
+(no registration, no token, no points quota), runs its own servers, and is
+the one free source that covers daily *and* 5/15/30/60-minute A-share bars
+with years of history, valuation fields, industry classification and
+fundamentals behind a single stable API. The alternatives considered:
+
+- **Tushare Pro** — needs registration and a token, and minute bars sit
+  behind its paid points tiers.
+- **JoinQuant JQData** — a free *trial* account with a daily quota; good
+  data, but it needs credentials and the trial expires.
+- **Sina / Tencent quote endpoints** — free, but undocumented and capped at
+  recent bars, with no valuation or fundamentals. Sina is used here only
+  for what BaoStock lacks (index minute bars).
+- **East Money's public endpoints** — excluded by request.
+
+**Trade-offs worth knowing.** BaoStock is end-of-day: a session's bars
+arrive that evening, and there is no live intraday feed, so this is a
+post-close analysis tool. The whole-market cross-section depends on
+BaoStock's `query_daily_history_k_AStock`, which only newer releases have;
+without it, industry ranks fall back to a 13-stock peer sample, market-
+wide ranks are skipped, and the report says so. BaoStock has no industry
+*index*, so the industry benchmark is an equal-weighted composite of the
+stock's most-traded CSRC-industry peers. Northbound (Stock-Connect)
+holdings are gone: per-stock northbound data is no longer published daily,
+and the only free per-stock series came through East Money.
 
 ## Source methodology: DGNSDE
 
@@ -159,8 +177,9 @@ plus 100 unrelated peers:
 | 2 months daily | 27% | 3% |
 | 2 months hourly | 54% | 3% |
 
-Lag search is capped at ±10 days on daily bars and ±16 hours on hourly
-bars, and further limited to about one-eighth of the sample.
+Lag search is capped at ±10 days on daily bars and at four sessions on
+intraday bars (±16 bars at 60m, ±32 at 30m, ±64 at 15m), and further
+limited to about one-eighth of the sample.
 
 **The signal.** For every linked peer leading by at least half a bar, read
 the move that peer has already made over exactly its (fractional) lead
@@ -182,7 +201,7 @@ Five factor categories, each producing a 0–100 sub-score
 | Technical | 25% | MA trend, RSI, MACD, momentum (1m/3m/6m/12m, 12-1), realized volatility, 52-week range, **geometric-SDE drift/diffusion** |
 | Valuation | 15% | PE/PB level, plus **cross-sectional** cheapness rank (see below) |
 | Growth & quality | 20% | Revenue/profit YoY growth, gross/net margin, ROE, EPS trend |
-| Capital flow | 10% | Main-fund net inflow (5d/20d), northbound (Stock-Connect) holding change, margin balance |
+| Capital flow | 10% | THS net inflow over 5/20 sessions, scaled by trading value and percentile-ranked within industry and market; bar-direction flow estimate; margin balance |
 | **Cross-sectional linkage** | 30% | See below |
 
 Linkage carries the largest weight because DGNSDE's ablation found the
@@ -204,18 +223,19 @@ readings, not a calibrated probability or investment advice.
 
 This is the category the brief asked to lean on hardest. Instead of
 describing a stock only by its own time series, these factors place it
-inside its peer cross-section — industry board and whole market — at each
+inside its peer cross-section — CSRC industry and whole market — at each
 point in time:
 
-- **Market beta / correlation / R²** — trailing-120-day OLS beta,
-  correlation, and R² of the stock's daily returns against the CSI 300.
-  R² is "how much of this stock's variance is systemic market risk."
-- **Industry beta / correlation / R²** — same, against its own industry
-  board index (isolates sector-specific co-movement from broad-market
-  co-movement).
+- **Market beta / correlation / R²** — OLS beta, correlation and R² of the
+  stock's bar returns against the CSI 300 over the timeframe's window
+  (120 daily bars, or ~40 sessions of intraday bars). R² is "how much of
+  this stock's variance is systemic market risk."
+- **Industry beta / correlation / R²** — same, against an equal-weighted
+  composite of its most-traded CSRC-industry peers (isolates sector co-
+  movement from broad-market co-movement).
 - **Return percentile within industry / within market** — this stock's
-  percentile rank (0–100) on today's return and 60-day return, computed
-  against the *live* industry-peer and whole-market cross-sections — not
+  percentile rank (0–100) on the latest session's return and 60-session
+  return, computed against the industry and whole-market cross-sections — not
   against its own history. This is the literal cross-sectional treatment:
   percentile-ranking against peers rather than using raw absolute numbers.
 - **Value rank within industry / within market** — same idea applied to
@@ -226,10 +246,10 @@ point in time:
   the dashboard), plus the stock's average correlation with that peer group
   and its 3 most-correlated peers. High average correlation = the stock
   trades mostly as part of the sector herd; low = mostly idiosyncratic.
-- **Fund-flow / sector fund-flow correlation** — same-day correlation
-  between the stock's own main-fund net inflow and its industry's aggregate
-  net inflow, capturing whether sector-wide capital rotation is pulling (or
-  pushing) this name.
+- **Money-flow rank** (scored under capital flow) — THS net inflow over 5
+  and 20 sessions, divided by the stock's trading value so company size
+  doesn't dominate, percentile-ranked against its industry and the whole
+  market.
 - **Lead-lag network** (see the DGNSDE section above) — who moves before
   this stock and by how many fractional days, the move those leaders have
   already made that it hasn't yet followed (`leading_peer_signal_pct`,
@@ -245,48 +265,49 @@ same-day yet be tightly linked at a 2-day offset.
 
 ## Caching
 
-Every AKShare call goes through `quant/cache.py` (disk cache, pickle,
-TTL-based — 15 min for the whole-market snapshot, 30 min for price/flow
-history, 1 hour for index/industry history, 1 day for slow-changing things
-like industry classification and fundamentals). This keeps the dashboard
-responsive across button clicks. Delete `quant/.cache/` (or call
-`quant.cache.clear()`) to force fresh data.
+Every fetch goes through `quant/cache.py` (disk cache, pickle, TTL-based).
+BaoStock data changes once a day, so bars cache for an hour, the market
+cross-section for six hours, and industry classification and fundamentals
+for a day; THS money flow caches for an hour. Delete `quant/.cache/` (or
+call `quant.cache.clear()`) to force fresh data. The first run on a new
+code fetches the stock plus 12 peers and takes longest.
 
 ## Offline self-test
 
-AKShare has no test/sandbox mode — it's live scrapers of public endpoints.
-`python -m quant.selftest` mocks every AKShare call with synthetic data
-shaped like the real schemas and runs the full pipeline end to end
-(data → factors → composite score), so you can sanity-check the install
-without hitting the network or waiting on rate limits. It runs three
-scenarios — 18-month daily, two-month daily, two-month hourly — and checks,
-among other things, that linked peers' lags come out within one bar of the
-lags the synthetic universe was built with, and that long-horizon factors
-are n/a on a two-month window.
+None of the sources has a test mode. `python -m quant.selftest` replaces
+them with synthetic data shaped like the real responses — BaoStock is faked
+at the library level with string fields, `YYYYMMDDHHMMSSsss` minute
+timestamps and decimal ratios; THS tables carry `1.23亿`-style amounts and
+integer codes with lost leading zeros — and runs the whole pipeline. Six
+scenarios: 18-month daily; two-month daily, 60m, 30m and 15m; and a run
+with the whole-market query unavailable, which must fall back to the peer
+sample. Among other things it checks that linked peers' lags land within
+one bar of the lags the synthetic universe was built with, that bar times
+match each timeframe's session schedule, that annualized volatility agrees
+across timeframes, and that long-horizon factors are n/a on two months.
 
 ## Known limitations
 
-- **Margin trading** (`margin_snapshot`) is published by the exchanges as a
-  per-day, all-symbols snapshot with no per-stock history endpoint, so this
-  reports only the most recent available day's balance, not a time series.
-- **Northbound (Stock-Connect) holding** is empty for stocks outside the
-  Connect universe — this is expected, not a bug.
-- **Concept-board (概念板块) linkage** was left out: AKShare has no cheap
-  reverse lookup from a stock to its concept-board memberships, and
-  reconstructing it by scanning every board is too slow for an interactive
-  dashboard. Industry-board linkage (a stricter, single classification) is
-  used instead.
+- **End-of-day data.** BaoStock publishes after the close, so intraday
+  timeframes analyze completed sessions, not the live one.
+- **Margin trading** is published by the exchanges as a per-day,
+  all-symbols file with no per-stock history, so this reports only the
+  most recent available day's balance.
+- **THS money flow** is a ranking snapshot per horizon, not a per-stock
+  daily history, so there is no money-flow time series; the dashboard's
+  daily flow chart is the bar-direction estimate, labelled as such.
+- **Concept-board (概念板块) linkage** is not included; the CSRC industry
+  (a single, stricter classification) defines peers.
 - Weights in `model.py` encode a reasonable prior informed by DGNSDE's
   ablation, not a fitted or backtested result for this scoring model. Tune
   `CATEGORY_WEIGHTS` and the per-factor scoring bands in `quant/model.py`
   for your own view.
 - **Lead-lag resolution is one bar.** The fractional refinement is a
   parabolic fit to the correlation peak, good to roughly ±1 bar on the
-  benchmark. On daily bars that is ±1 day; use hourly bars when the
-  question is "a few hours or a day?".
+  benchmark: ±1 day on daily bars, ±15 minutes on 15-minute bars.
 - **No RankIC/ICIR validation is included.** Measuring it properly needs
   point-in-time factor recomputation across a universe and many rebalance
-  dates — every factor here is computed as-of-now only. Without that, the
-  composite score is a structured summary of current readings, and there is
-  no evidence in this repo about its predictive power. That would be the
-  natural next thing to build.
+  dates; every factor here is computed as-of-now only. The composite score
+  is a structured summary of current readings, and there is no evidence in
+  this repo about its predictive power. That would be the natural next
+  thing to build.

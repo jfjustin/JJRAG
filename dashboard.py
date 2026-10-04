@@ -3,8 +3,9 @@
     streamlit run dashboard.py
 
 One text box for a stock code, a handful of buttons that switch the view,
-each rendering its own Plotly visualization(s). All data comes from
-AKShare (free, no login) via quant/report.py.
+each rendering its own Plotly visualization(s). Data comes from BaoStock,
+Sina, 同花顺 and the exchanges — free, no login, no East Money — via
+quant/report.py.
 """
 
 import numpy as np
@@ -28,11 +29,14 @@ VIEWS = [
 FREQ_LABELS = {key: tf["label"] for key, tf in report.TIMEFRAMES.items()}
 
 # (label, freq, lookback days, short MA, long MA). MAs are in bars: on a
-# two-month daily window only ~44 bars exist, so 5/20 is what fits; on
-# hourly bars 20/60 is roughly one and three weeks of trading.
+# two-month daily window only ~44 bars exist, so 5/20 is what fits. On
+# intraday bars 20/60 spans 5/15 sessions at 60m, 2.5/7.5 at 30m and
+# 1.25/3.75 at 15m.
 PRESETS = [
     ("近两月·日线 2M daily", "daily", 61, 5, 20),
-    ("近两月·小时 2M hourly", "60m", 61, 20, 60),
+    ("近两月·60分 2M 60m", "60m", 61, 20, 60),
+    ("近两月·30分 2M 30m", "30m", 61, 20, 60),
+    ("近两月·15分 2M 15m", "15m", 61, 20, 60),
     ("一年半·日线 18M daily", "daily", 548, 20, 60),
 ]
 
@@ -56,7 +60,7 @@ def run_analysis(code, freq, days, short_ma, long_ma):
     st.session_state.error = None
     try:
         with st.spinner(f"Fetching & scoring {code} on {FREQ_LABELS[freq]} bars, "
-                        f"{days}-day window ... several live AKShare endpoints, ~10-60s"):
+                        f"{days}-day window ... BaoStock + THS + Sina, ~20-90s on first run"):
             st.session_state.report = report.build_report(
                 code, lookback_days=days, short_ma=short_ma, long_ma=long_ma,
                 freq=freq)
@@ -70,7 +74,8 @@ def run_analysis(code, freq, days, short_ma, long_ma):
 # ---------------------------------------------------------------------------
 
 st.title("截面联动 Quant Dashboard")
-st.caption("Free AKShare data · cross-sectional-linkage-weighted multi-factor model · runs entirely on your machine")
+st.caption("BaoStock · Sina · 同花顺 · SSE/SZSE — free, no login, no East Money · "
+           "cross-sectional-linkage-weighted multi-factor model · runs entirely on your machine")
 
 top = st.columns([3, 1.3, 1, 1, 1, 1.3])
 with top[0]:
@@ -126,7 +131,8 @@ if r is not None:
     header[3].metric("信号 Stance", r.stance)
     st.caption(f"**{FREQ_LABELS[r.freq]}** · window {r.start} → {r.end} · "
                f"{len(r.prices)} bars · last bar {r.as_of} · "
-               f"MA{r.short_ma}/MA{r.long_ma} ({r.bar_unit} bars)")
+               f"MA{r.short_ma}/MA{r.long_ma} ({r.bar_unit} bars) · "
+               f"cross-section: {r.cross_section or 'n/a'}")
 
     if r.warnings:
         with st.expander(f"⚠️ {len(r.warnings)} data warning(s)"):
@@ -163,9 +169,9 @@ if r is not None:
                 "涨跌幅 % Chg": snap.get("pct_chg"),
                 "市盈率 PE (TTM)": snap.get("pe_ttm"),
                 "市净率 PB": snap.get("pb"),
-                "总市值 Mkt Cap": snap.get("total_mkt_cap"),
+                "换手率 Turnover %": snap.get("turnover"),
+                "成交额 Amount": snap.get("amount"),
                 "60日涨跌幅 60d %": snap.get("ret_60d"),
-                "年初至今 YTD %": snap.get("ret_ytd"),
             }
             st.table(pd.DataFrame(info_rows.items(), columns=["指标", "值"]))
 
@@ -266,13 +272,16 @@ if r is not None:
         m2[2].metric("行业内估值排名 Value rank vs industry",
                      f"{link.get('value_rank_industry', float('nan')):.0f}%ile"
                      if link.get("value_rank_industry") == link.get("value_rank_industry") else "n/a")
-        m2[3].metric("资金流-行业相关性 Fund-flow vs sector corr",
-                     f"{link.get('fundflow_industry_corr', float('nan')):.2f}"
-                     if link.get("fundflow_industry_corr") == link.get("fundflow_industry_corr") else "n/a")
+        m2[3].metric("60日行业百分位 60d rank in industry",
+                     f"{link.get('ret_60d_pctile_industry', float('nan')):.0f}%ile"
+                     if link.get("ret_60d_pctile_industry") == link.get("ret_60d_pctile_industry") else "n/a")
 
-        st.caption("Beta/corr/R² are computed on the trailing ~120 trading days of daily returns. "
-                  "R² measures how much of this stock's variance is explained by its benchmark — "
-                  "high = tightly linked / systemic, low = idiosyncratic / stock-specific moves.")
+        tf = report.TIMEFRAMES[r.freq]
+        st.caption(f"Beta/corr/R² use the last {tf['beta_window']} {r.bar_unit} bars, "
+                   "against the CSI 300 and against an equal-weighted composite of the "
+                   "stock's most-traded CSRC-industry peers (BaoStock has no industry index). "
+                   "R² is the share of this stock's variance its benchmark explains — "
+                   "high = tightly linked, low = stock-specific moves.")
 
         st.subheader("同行业相关性网络 Peer correlation network")
         corr_matrix = link.get("peer_corr_matrix")
@@ -299,7 +308,7 @@ if r is not None:
     elif view == "leadlag":
         link = r.linkage
         net = link.get("leadlag_network")
-        hourly = r.bar_unit == "hour"
+        hourly = r.bar_unit != "day"
         unit, col = ("h", "lead_hours") if hourly else ("d", "lead_days")
         st.subheader("时滞联动 Lead-lag structure")
         st.caption(
@@ -402,40 +411,75 @@ if r is not None:
     # Capital flow
     # -----------------------------------------------------------------
     elif view == "flow":
-        ff = r.fund_flow
-        if ff.empty:
-            st.warning("No fund-flow history available for this stock.")
-        else:
-            ff = ff.sort_values("date").copy()
-            ff["cum_main_inflow"] = ff["main_net_inflow"].cumsum()
+        cf = r.capital_flow
+
+        def _yuan(v):
+            if v is None or v != v:
+                return "n/a"
+            return f"{v / 1e8:+.2f}亿" if abs(v) >= 1e8 else f"{v / 1e4:+.0f}万"
+
+        def _pctl(key):
+            v = cf.get(key)
+            return f"{v:.0f}%ile" if v is not None and v == v else "n/a"
+
+        st.subheader("同花顺资金流 THS money flow")
+        m = st.columns(4)
+        for col, h in zip(m, ("3d", "5d", "10d", "20d")):
+            col.metric(f"{h[:-1]}日净流入 {h} net inflow", _yuan(r.flow_values.get(h)))
+        m2 = st.columns(4)
+        m2[0].metric("5日行业百分位 5d rank in industry", _pctl("inflow_5d_pctile_industry"))
+        m2[1].metric("20日行业百分位 20d rank in industry", _pctl("inflow_20d_pctile_industry"))
+        m2[2].metric("5日全市场百分位 5d rank in market", _pctl("inflow_5d_pctile_market"))
+        margin = cf.get("margin_balance")
+        m2[3].metric("融资余额 Margin balance", _yuan(margin) if margin else "n/a")
+        st.caption("Ranks compare net inflow scaled by each stock's trading value"
+                   if cf.get("inflow_scaled_by_turnover") else
+                   "Ranks compare raw net inflow (no turnover available to scale by), "
+                   "so they lean toward larger companies.")
+
+        fp = r.flow_peers
+        if fp is not None and not fp.empty:
+            st.subheader("行业5日资金流 5-day net inflow across the industry")
+            sym = r.code.split(".")[0]
+            show = fp.head(15)
+            if sym not in show["code"].values:
+                show = pd.concat([show, fp[fp["code"] == sym]])
+            labels = [f"{c} {n}" if isinstance(n, str) else c
+                      for c, n in zip(show["code"], show["name"])]
+            fig = go.Figure(go.Bar(
+                x=show["net_inflow"] / 1e8, y=labels, orientation="h",
+                marker_color=["#F5A623" if c == sym else
+                              ("#C1443C" if v >= 0 else "#2E86AB")
+                              for c, v in zip(show["code"], show["net_inflow"])]))
+            fig.update_layout(height=max(360, 26 * len(show)),
+                              margin=dict(l=10, r=10, t=10, b=10),
+                              xaxis_title="亿 CNY", yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(f"Top 15 of {len(fp)} industry stocks by 5-day net inflow; "
+                       "this stock highlighted in orange.")
+
+        p = r.prices
+        if not p.empty and "amount" in p:
+            st.subheader("K线方向资金估算 Bar-direction flow (estimate)")
+            sign = np.sign(p["close"] - p["open"]).fillna(0)
+            daily = (p.assign(signed=p["amount"] * sign, day=p["date"].dt.date)
+                     .groupby("day")["signed"].sum())
             fig = go.Figure()
-            fig.add_trace(go.Bar(x=ff["date"], y=ff["main_net_inflow"],
-                                 name="主力净流入 Main net inflow (daily)",
-                                 marker_color=np.where(ff["main_net_inflow"] >= 0, "#C1443C", "#2E86AB")))
-            fig.add_trace(go.Scatter(x=ff["date"], y=ff["cum_main_inflow"],
+            fig.add_trace(go.Bar(x=list(daily.index), y=daily.values / 1e8, name="Daily",
+                                 marker_color=np.where(daily.values >= 0, "#C1443C", "#2E86AB")))
+            fig.add_trace(go.Scatter(x=list(daily.index), y=daily.cumsum().values / 1e8,
                                      name="累计 Cumulative", yaxis="y2",
                                      line=dict(color="#F5A623", width=2)))
-            fig.update_layout(
-                height=420, margin=dict(l=10, r=10, t=30, b=10),
-                yaxis=dict(title="Daily net inflow (CNY)"),
-                yaxis2=dict(title="Cumulative", overlaying="y", side="right"),
-                legend=dict(orientation="h"),
-            )
+            fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10),
+                              yaxis=dict(title="亿 CNY"),
+                              yaxis2=dict(title="Cumulative", overlaying="y", side="right"),
+                              legend=dict(orientation="h"))
             st.plotly_chart(fig, use_container_width=True)
-
-        cf = r.capital_flow
-        m = st.columns(3)
-        m[0].metric("5日主力净流入 5d main inflow",
-                    f"{cf.get('main_inflow_5d_sum', 0):,.0f}" if cf.get("main_inflow_5d_sum") == cf.get("main_inflow_5d_sum") else "n/a")
-        m[1].metric("20日主力净流入 20d main inflow",
-                    f"{cf.get('main_inflow_20d_sum', 0):,.0f}" if cf.get("main_inflow_20d_sum") == cf.get("main_inflow_20d_sum") else "n/a")
-        m[2].metric("融资余额 Margin balance",
-                    f"{cf.get('margin_balance', 0):,.0f}" if cf.get("margin_balance") == cf.get("margin_balance") else "n/a")
-
-        if "northbound_hold_ratio_latest" in cf:
-            st.caption(f"北向资金持股占比 Northbound holding ratio: "
-                      f"{cf['northbound_hold_ratio_latest']:.2f}% "
-                      f"(20d change: {cf.get('northbound_hold_ratio_chg_20d', float('nan')):+.2f}pp)")
+            v = cf.get("bar_direction_flow")
+            ratio = f"Window ratio: {v:+.2f}. " if v is not None and v == v else ""
+            st.caption(f"Each {r.freq} bar's traded value counted positive if it closed "
+                       f"above its open, negative if below, summed per day. {ratio}"
+                       "An estimate from price bars, not exchange order-size data.")
 
     # -----------------------------------------------------------------
     # Factor radar

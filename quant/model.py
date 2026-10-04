@@ -114,10 +114,13 @@ def score_growth_quality(f):
 
 
 def score_capital_flow(f):
+    # THS money flow, ranked cross-sectionally (already 0-100), plus the
+    # bar-direction estimate from our own bars (in [-1, 1]).
     scores = {
-        "main_inflow_5d": _clip_linear(f.get("main_inflow_5d_sum"), -2e8, 2e8),
-        "main_inflow_20d": _clip_linear(f.get("main_inflow_20d_sum"), -5e8, 5e8),
-        "northbound_chg_20d": _clip_linear(f.get("northbound_hold_ratio_chg_20d"), -0.5, 0.5),
+        "inflow_5d_pctile_industry": f.get("inflow_5d_pctile_industry", np.nan),
+        "inflow_20d_pctile_industry": f.get("inflow_20d_pctile_industry", np.nan),
+        "inflow_5d_pctile_market": f.get("inflow_5d_pctile_market", np.nan),
+        "bar_direction_flow": _clip_linear(f.get("bar_direction_flow"), -0.3, 0.3),
     }
     return _avg(scores), scores
 
@@ -125,9 +128,9 @@ def score_capital_flow(f):
 def score_linkage(linkage):
     scores = {
         "ret_today_pctile_industry": linkage.get("ret_today_pctile_industry", np.nan),
+        "ret_60d_pctile_industry": linkage.get("ret_60d_pctile_industry", np.nan),
         "ret_60d_pctile_market": linkage.get("ret_60d_pctile_market", np.nan),
         "industry_r2_moderate": _band_score(linkage.get("industry_r2"), center=0.35, width=0.5),
-        "fundflow_industry_corr": _clip_linear(linkage.get("fundflow_industry_corr"), -1, 1),
         "peer_avg_corr_moderate": _band_score(linkage.get("peer_avg_corr"), center=0.5, width=0.7),
         "leading_peer_signal": _clip_linear(linkage.get("leading_peer_signal_pct"), -5, 5),
     }

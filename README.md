@@ -99,8 +99,9 @@ Environment-variable keys are optional — the in-app key box is the primary pat
 ## Quant dashboard
 
 This repo also ships a separate, unrelated tool: a local Streamlit dashboard
-for cross-sectional multi-factor equity analysis (China A-shares), built on
-free AKShare data — no paid account or API key required. See
+for cross-sectional multi-factor equity analysis (China A-shares) on daily,
+60-, 30- and 15-minute bars. Data comes from BaoStock, Sina, 同花顺 and the
+exchanges — free, no account or API key, no East Money. See
 [`quant/README.md`](quant/README.md) for setup and methodology, or jump
 straight in:
 

@@ -1,7 +1,8 @@
 """Terminal report for a single stock (no dashboard needed).
 
     python -m quant.cli 300274.SZ
-    python -m quant.cli 300476.SZ --days 61 --freq both    # 2-month daily + hourly
+    python -m quant.cli 300476.SZ --days 61 --freq all     # daily, 60m, 30m, 15m
+    python -m quant.cli 300476.SZ --days 61 --freq 15m,30m
 """
 
 import argparse
@@ -18,14 +19,20 @@ def _fmt(v, suffix=""):
 
 
 def _lead(link, key, unit):
-    """Format a lead-lag scalar in days, plus native hours on hourly bars."""
+    """Format a lead-lag scalar in days, plus trading hours on intraday bars."""
     days = link.get(key)
     if days is None or days != days:
         return "n/a"
-    if unit == "hour":
+    if unit != "day":
         hours = link.get(key.replace("_days", "_hours"))
         return f"{days:+.2f}d ({hours:+.1f} trading hours)"
     return f"{days:+.2f}d"
+
+
+def _yuan(v):
+    if v is None or v != v:
+        return "n/a"
+    return f"{v / 1e8:+.2f}亿" if abs(v) >= 1e8 else f"{v / 1e4:+.0f}万"
 
 
 def print_report(r):
@@ -33,6 +40,8 @@ def print_report(r):
     print(f"\n{r.code}  {r.name}  |  行业 Industry: {r.industry or 'n/a'}")
     print(f"周期 Timeframe: {tf}  |  window {r.start} → {r.end}  "
           f"|  {len(r.prices)} bars  |  last bar {r.as_of}")
+    print(f"Cross-section: {r.cross_section or 'n/a'}  |  data: BaoStock, Sina (index "
+          f"minute bars), 同花顺 (money flow), SSE/SZSE (margin)")
     print("=" * 78)
     print(f"COMPOSITE SCORE: {_fmt(r.composite_score)} / 100   ->   {r.stance}")
     print("-" * 78)
@@ -60,7 +69,17 @@ def print_report(r):
     print(f"  60d return percentile within whole market  : {_fmt(link.get('ret_60d_pctile_market'))}")
     print(f"  Value rank (cheapness) within industry      : {_fmt(link.get('value_rank_industry'))}")
     print(f"  Avg same-day correlation with peers         : {_fmt(link.get('peer_avg_corr'))}")
-    print(f"  Stock-vs-sector fund-flow correlation       : {_fmt(link.get('fundflow_industry_corr'))}")
+    print(f"  60d return percentile within industry      : {_fmt(link.get('ret_60d_pctile_industry'))}")
+
+    cf = r.capital_flow
+    print("\n--- Money flow (同花顺 THS) ---")
+    flows = "  ".join(f"{h}: {_yuan(v)}" for h, v in r.flow_values.items())
+    print(f"  Net inflow            : {flows or 'n/a'}")
+    print(f"  5d inflow percentile  : industry {_fmt(cf.get('inflow_5d_pctile_industry'))}  "
+          f"market {_fmt(cf.get('inflow_5d_pctile_market'))}"
+          f"{'  (scaled by turnover)' if cf.get('inflow_scaled_by_turnover') else ''}")
+    print(f"  Bar-direction flow    : {_fmt(cf.get('bar_direction_flow'))}  "
+          f"(signed traded value / total over the window, estimate)")
 
     print("\n--- Lead-lag network (时滞联动) ---")
     print(f"  Peers linked          : {link.get('n_linked_peers', 0)} of "
@@ -72,8 +91,8 @@ def print_report(r):
           f"(positive = it leads its sector)")
     net = link.get("leadlag_network")
     if net is not None and not net.empty:
-        col = "lead_hours" if r.bar_unit == "hour" else "lead_days"
-        unit = "h" if r.bar_unit == "hour" else "d"
+        col = "lead_hours" if r.bar_unit != "day" else "lead_days"
+        unit = "h" if r.bar_unit != "day" else "d"
         shown = net.sort_values(["linked", "lag_corr"], ascending=False)
         for label, row in shown.iterrows():
             if row["linked"]:
@@ -99,8 +118,9 @@ def main():
     parser.add_argument("code", help="Stock code, e.g. 300274.SZ")
     parser.add_argument("--days", type=int, default=548,
                         help="Calendar-day lookback (default 548; ~61 for two months)")
-    parser.add_argument("--freq", choices=["daily", "60m", "both"], default="daily",
-                        help="Bar timeframe; 'both' runs daily then 60-minute")
+    parser.add_argument("--freq", default="daily",
+                        help="Timeframe(s), comma-separated: daily, 60m, 30m, 15m — "
+                             "or 'all'. Example: --freq daily,15m")
     parser.add_argument("--short", type=int, default=None, help="Short MA (bars)")
     parser.add_argument("--long", type=int, default=None, help="Long MA (bars)")
     args = parser.parse_args()
@@ -108,9 +128,19 @@ def main():
     # Sensible per-timeframe defaults: on hourly bars 20/60 is ~1 and ~3
     # weeks of trading; on a narrow daily window 5/20 is what fits.
     narrow = args.days < 120
-    defaults = {"daily": (5, 20) if narrow else (20, 60), "60m": (20, 60)}
+    # MAs are in bars. 20/60 on intraday bars spans 5/15 sessions at 60m,
+    # 2.5/7.5 at 30m and 1.25/3.75 at 15m — short-horizon reads by design.
+    defaults = {"daily": (5, 20) if narrow else (20, 60),
+                "60m": (20, 60), "30m": (20, 60), "15m": (20, 60)}
 
-    freqs = ["daily", "60m"] if args.freq == "both" else [args.freq]
+    if args.freq == "all":
+        freqs = list(report.TIMEFRAMES)
+    else:
+        freqs = [f.strip() for f in args.freq.split(",") if f.strip()]
+    unknown = [f for f in freqs if f not in report.TIMEFRAMES]
+    if unknown:
+        parser.error(f"unknown timeframe(s) {unknown}; choose from "
+                     f"{list(report.TIMEFRAMES)} or 'all'")
     for freq in freqs:
         short, long = defaults[freq]
         r = report.build_report(args.code, lookback_days=args.days,

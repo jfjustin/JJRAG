@@ -1,18 +1,23 @@
-"""Offline self-test: mocks every AKShare call with synthetic data shaped
-like the real API responses, then runs the full report pipeline end to end.
+"""Offline self-test: replaces every data source with synthetic data shaped
+like the real responses, then runs the full report pipeline end to end.
 
-This exists because AKShare talks to live public endpoints with no test
-mode — this is the only way to check the data.py -> factors.py -> model.py
--> report.py wiring is correct without a network call. It is NOT a
-validation of AKShare's real-world data; run `python -m quant.cli <code>`
-against the network for that.
+None of the sources has a test mode, so this is the only way to check the
+bsapi -> data -> factors -> model -> report wiring without the network. It
+is NOT a validation of real market data; run `python -m quant.cli <code>`
+for that.
 
     python -m quant.selftest
 
-Three scenarios run: the default ~18-month daily report, a two-month
-daily window, and a two-month 60-minute window. The mocks honor the
-start/end dates they're asked for, on a calendar ending today, so the
-narrow scenarios really do get narrow data.
+BaoStock is faked at the library level — result sets hand back string
+fields, minute bars carry YYYYMMDDHHMMSSsss timestamps, ratios are
+decimals — so the adapter's parsing is exercised too. THS tables carry
+'1.23亿'-style amounts and integer codes with lost leading zeros, as
+read_html produces them.
+
+Scenarios: 18-month daily; two-month daily, 60m, 30m and 15m; and a
+two-month daily run with BaoStock's whole-market query unavailable, which
+must fall back to a peer-sample cross-section. The synthetic universe has
+known lead-lags, and the test checks they are recovered.
 
 `install_mocks()` is reusable — e.g. to drive the dashboard offline.
 """
@@ -20,237 +25,269 @@ narrow scenarios really do get narrow data.
 import sys
 import zlib
 from datetime import datetime
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pandas as pd
 
-TARGET_CODE = "300274"
-TARGET_INDUSTRY = "电源设备"
-N_DAYS = 400                       # synthetic daily history length (bars)
-HOURLY_CLOSES = ("10:30", "11:30", "14:00", "15:00")
+TARGET_CODE = "300476"
+TARGET_NAME = "测试标的"
+INDUSTRY = "C39计算机、通信和其他电子设备制造业"
+OTHER_INDUSTRY = "C38电气机械和器材制造业"
+N_DAYS = 400
+N_INTRADAY_DAYS = 90
 
-# Deterministic lead assignment (in bars): the target sits at 0, some
-# peers lead it, some lag, and two carry no sector loading at all.
+# Bar close times per session, per minute frequency.
+SESSION_BARS = {
+    "60": ["10:30", "11:30", "14:00", "15:00"],
+    "30": ["10:00", "10:30", "11:00", "11:30", "13:30", "14:00", "14:30", "15:00"],
+    "15": ["09:45", "10:00", "10:15", "10:30", "10:45", "11:00", "11:15", "11:30",
+           "13:15", "13:30", "13:45", "14:00", "14:15", "14:30", "14:45", "15:00"],
+}
+# Per-bar sector step and idiosyncratic noise, scaled by sqrt(bar length)
+# so every timeframe has the same signal-to-noise (true-lag corr ~0.3).
+SCALES = {"d": (0.018, 0.012), "60": (0.009, 0.006), "30": (0.0064, 0.0042),
+          "15": (0.0045, 0.003)}
+
 LEADS = {"300000": 3.0, "300001": 2.0, "300002": 4.0,
          "300003": -2.0, "300004": -3.0}
 NOISE_ONLY = {"300005", "300006"}
+UNIVERSE = [TARGET_CODE] + [f"{300000 + i:06d}" for i in range(59)]
 
 
 def _seed(symbol):
-    # crc32, not hash(): str hashing is salted per process, which would
-    # make this test's data — and its assertions — differ run to run.
+    # crc32, not hash(): str hashing is salted per process.
     return zlib.crc32(symbol.encode()) % (2 ** 31)
 
 
 def _true_lead(label):
-    """The lead (in bars) the mock universe assigned to a peer label."""
+    """The lead (in bars) the synthetic universe assigned to a peer label."""
     code = label.split()[0]
     return LEADS.get(code, float((_seed(code) % 7) - 3))
 
 
-def _daily_calendar(n=N_DAYS):
+def _industry_of(code):
+    return INDUSTRY if code == TARGET_CODE or int(code) % 3 != 2 else OTHER_INDUSTRY
+
+
+def _trading_days(n):
     return pd.bdate_range(end=pd.Timestamp(datetime.now().date()), periods=n)
 
 
-def _hourly_calendar(n_days=N_DAYS):
-    stamps = [pd.Timestamp(f"{d.date()} {t}")
-              for d in _daily_calendar(n_days) for t in HOURLY_CLOSES]
-    return pd.DatetimeIndex(stamps)
-
-
-def _hist_from_close(close, seed=0, dates=None, time_col="日期", fmt="%Y-%m-%d"):
-    """Wrap a close-price array in the column layout AKShare returns."""
-    n = len(close)
-    rng = np.random.default_rng(seed)
-    if dates is None:
-        dates = _daily_calendar(n)
-    close = np.asarray(close, dtype=float)
-    open_ = close * (1 + rng.normal(0, 0.003, n))
-    high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.005, n)))
-    low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.005, n)))
-    volume = rng.integers(1_000_000, 8_000_000, n)
-    return pd.DataFrame({
-        time_col: dates.strftime(fmt),
-        "开盘": open_.round(2), "收盘": close.round(2),
-        "最高": high.round(2), "最低": low.round(2),
-        "成交量": volume, "成交额": (volume * close).round(0),
-        "振幅": rng.uniform(1, 5, n).round(2),
-        "涨跌幅": (pd.Series(close).pct_change().fillna(0) * 100).round(2),
-        "涨跌额": pd.Series(close).diff().fillna(0).round(2),
-        "换手率": rng.uniform(0.5, 6, n).round(2),
-    })
-
-
-def _sector_universe(n, max_shift=6, seed=5, step_scale=0.018):
-    """A sector factor plus per-symbol lead/lag offsets.
-
-    Symbol i's returns are the sector factor read `lead_i` bars *ahead* of
-    the target's, so a symbol with lead_i > 0 genuinely moves before the
-    target — which is what the lead-lag estimator has to recover.
-    """
+def _sector_universe(n, step, max_shift=6, seed=5):
     rng = np.random.default_rng(seed)
     pad = max_shift + 2
-    sector = (pd.Series(rng.normal(0.0004, 1.0, n + 2 * pad))
-              .rolling(4).mean().fillna(0).values * step_scale)
+    sector = pd.Series(rng.normal(0.0004, 1.0, n + 2 * pad)).rolling(4).mean().fillna(0).values * step
 
-    def series_for(lead, beta, noise_seed, start_price, noise=0.012):
+    def series_for(lead, beta, noise_seed, start_price, noise):
         r = np.random.default_rng(noise_seed)
-        start = pad + int(round(lead))
-        rets = sector[start:start + n] * beta + r.normal(0, noise, n)
-        return start_price * np.exp(np.cumsum(rets))
-
+        s = pad + int(round(lead))
+        return start_price * np.exp(np.cumsum(sector[s:s + n] * beta + r.normal(0, noise, n)))
     return series_for
 
 
-def _close_for(symbol, series_for, noise=0.012):
+def _close_for(symbol, series_for, noise):
     seed = _seed(symbol)
     if symbol == TARGET_CODE:
         return series_for(0.0, 1.0, seed, 110.0, noise)
     if symbol in NOISE_ONLY:
         return series_for(0.0, 0.0, seed, 60.0, noise)
-    lead = LEADS.get(symbol, float((seed % 7) - 3))
-    return series_for(lead, 0.9, seed, float(50 + seed % 150), noise)
+    return series_for(_true_lead(symbol), 0.9, seed, float(50 + seed % 150), noise)
 
 
-def _between(df, col, start, end):
-    """Filter like the real endpoints do: on a date or datetime column."""
-    t = pd.to_datetime(df[col])
-    lo = pd.Timestamp(start) if start else t.min()
-    hi = pd.Timestamp(end) if end else t.max()
-    if len(str(end or "")) <= 8:  # 'YYYYMMDD' means through end of day
-        hi = hi + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-    return df[(t >= lo) & (t <= hi)].reset_index(drop=True)
+def _bs_code(code):
+    return f"{'sh' if code.startswith('6') else 'sz'}.{code}"
 
 
-def _synthetic_spot(n=60, seed=1):
-    rng = np.random.default_rng(seed)
-    codes = [TARGET_CODE] + [f"{300000 + i:06d}" for i in range(n - 1)]
+class _ResultSet:
+    """Mimics baostock.data.resultset.ResultData."""
+
+    def __init__(self, df, error_code="0", error_msg="success"):
+        self.error_code, self.error_msg = error_code, error_msg
+        self.fields = list(df.columns)
+        self._rows = df.astype(str).values.tolist()
+        self._i = -1
+
+    def next(self):
+        self._i += 1
+        return self._i < len(self._rows)
+
+    def get_row_data(self):
+        return self._rows[self._i]
+
+
+def _fmt(x, d=4):
+    return f"{x:.{d}f}"
+
+
+def _build_daily(code, days):
+    step, noise = SCALES["d"]
+    close = _close_for(code, _build_daily.universe, noise)
+    rng = np.random.default_rng(_seed(code) + 1)
+    pre = np.concatenate([[close[0]], close[:-1]])
+    vol = rng.integers(1_000_000, 8_000_000, len(close))
+    pe = (rng.uniform(10, 80) * close / close[-1]).round(4)
     return pd.DataFrame({
-        "代码": codes,
-        "名称": [f"公司{i}" for i in range(n)],
-        "最新价": rng.uniform(8, 200, n).round(2),
-        "涨跌幅": rng.normal(0, 3, n).round(2),
-        "成交量": rng.integers(1e5, 5e6, n),
-        "成交额": rng.uniform(1e7, 5e8, n),
-        "振幅": rng.uniform(1, 6, n).round(2),
-        "换手率": rng.uniform(0.3, 8, n).round(2),
-        "市盈率-动态": rng.uniform(8, 90, n).round(2),
-        "量比": rng.uniform(0.5, 3, n).round(2),
-        "总市值": rng.uniform(2e9, 5e11, n),
-        "流通市值": rng.uniform(1e9, 4e11, n),
-        "市净率": rng.uniform(0.8, 15, n).round(2),
-        "60日涨跌幅": rng.normal(0, 15, n).round(2),
-        "年初至今涨跌幅": rng.normal(0, 25, n).round(2),
+        "date": days.strftime("%Y-%m-%d"), "code": _bs_code(code),
+        "open": [_fmt(c * (1 + rng.normal(0, 0.003))) for c in close],
+        "high": [_fmt(c * 1.01) for c in close], "low": [_fmt(c * 0.99) for c in close],
+        "close": [_fmt(c) for c in close], "preclose": [_fmt(c) for c in pre],
+        "volume": vol.astype(str), "amount": [_fmt(v * c, 2) for v, c in zip(vol, close)],
+        "turn": [_fmt(t) for t in rng.uniform(0.5, 6, len(close))],
+        "tradestatus": "1", "pctChg": [_fmt(x) for x in (close / pre - 1) * 100],
+        "peTTM": [_fmt(x) for x in pe], "pbMRQ": _fmt(rng.uniform(1, 12)),
+        "psTTM": _fmt(rng.uniform(1, 10)), "isST": "0",
     })
 
 
-def install_mocks():
-    """Patch every AKShare call the package makes. Returns a function that
-    removes the patches again."""
-    daily_universe = _sector_universe(N_DAYS)
-    hourly_universe = _sector_universe(N_DAYS * 4, step_scale=0.009)
-    daily_cal, hourly_cal = _daily_calendar(), _hourly_calendar()
-    daily_cache, hourly_cache = {}, {}
+def _build_minute(code, freq, days):
+    step, noise = SCALES[freq]
+    stamps = [pd.Timestamp(f"{d.date()} {t}") for d in days for t in SESSION_BARS[freq]]
+    close = _close_for(code, _build_minute.universes[freq], noise)[-len(stamps):]
+    rng = np.random.default_rng(_seed(code) + int(freq))
+    vol = rng.integers(50_000, 900_000, len(close))
+    return pd.DataFrame({
+        "date": [s.strftime("%Y-%m-%d") for s in stamps],
+        "time": [s.strftime("%Y%m%d%H%M%S") + "000" for s in stamps],
+        "code": _bs_code(code),
+        "open": [_fmt(c * (1 + rng.normal(0, 0.002))) for c in close],
+        "high": [_fmt(c * 1.004) for c in close], "low": [_fmt(c * 0.996) for c in close],
+        "close": [_fmt(c) for c in close], "volume": vol.astype(str),
+        "amount": [_fmt(v * c, 2) for v, c in zip(vol, close)],
+    })
 
-    def fake_stock_zh_a_hist(symbol, start_date=None, end_date=None, **_):
-        if symbol not in daily_cache:
-            daily_cache[symbol] = _hist_from_close(
-                _close_for(symbol, daily_universe), _seed(symbol), daily_cal)
-        return _between(daily_cache[symbol], "日期", start_date, end_date)
 
-    def fake_stock_min(symbol, start_date=None, end_date=None, period="60", **_):
-        if symbol not in hourly_cache:
-            hourly_cache[symbol] = _hist_from_close(
-                _close_for(symbol, hourly_universe, noise=0.006), _seed(symbol),
-                hourly_cal, time_col="时间", fmt="%Y-%m-%d %H:%M:%S")
-        return _between(hourly_cache[symbol], "时间", start_date, end_date)
+def _ths_amount(v):
+    return f"{v / 1e8:.2f}亿" if abs(v) >= 1e8 else f"{v / 1e4:.2f}万"
 
-    def fake_individual_info_em(symbol, **_):
-        rows = [("股票代码", symbol), ("股票简称", "阳光电源"),
-                ("行业", TARGET_INDUSTRY), ("总股本", 2e9), ("流通股", 1.9e9),
-                ("总市值", 2.1e11), ("流通市值", 2.0e11),
-                ("上市时间", "20111102"), ("最新", 110.5)]
-        return pd.DataFrame(rows, columns=["item", "value"])
 
-    spot_df = _synthetic_spot()
+def install_mocks(whole_market=True):
+    """Patch BaoStock, Sina, THS and the exchange margin fetchers. Returns a
+    function that removes the patches. whole_market=False simulates a
+    BaoStock release without the per-date whole-market query."""
+    from quant import bsapi
 
-    def fake_industry_cons_em(symbol):
-        peers = spot_df.sample(n=15, random_state=2).copy()
-        if TARGET_CODE not in peers["代码"].values:
-            peers.iloc[0, peers.columns.get_loc("代码")] = TARGET_CODE
-        return peers[["代码", "名称", "最新价", "涨跌幅", "市盈率-动态",
-                      "市净率", "换手率", "成交额"]]
+    days = _trading_days(N_DAYS)
+    intraday_days = days[-N_INTRADAY_DAYS:]
+    _build_daily.universe = _sector_universe(N_DAYS, SCALES["d"][0])
+    _build_minute.universes = {
+        f: _sector_universe(N_INTRADAY_DAYS * len(SESSION_BARS[f]), SCALES[f][0])
+        for f in SESSION_BARS}
+    daily = {c: _build_daily(c, days) for c in UNIVERSE}
+    minute = {}
 
-    sector_daily = _hist_from_close(daily_universe(0.0, 1.0, 99, 1000.0, 0.004), 99, daily_cal)
-    sector_hourly = _hist_from_close(hourly_universe(0.0, 1.0, 99, 1000.0, 0.002), 99,
-                                     hourly_cal, time_col="日期时间",
-                                     fmt="%Y-%m-%d %H:%M:%S")
-    index_daily = _hist_from_close(daily_universe(0.0, 0.6, 42, 3800.0, 0.006), 42, daily_cal)
-    index_hourly = _hist_from_close(hourly_universe(0.0, 0.6, 42, 3800.0, 0.003), 42,
-                                    hourly_cal, time_col="时间", fmt="%Y-%m-%d %H:%M:%S")
+    def query_history(code, fields, start_date=None, end_date=None, frequency="d", adjustflag="3"):
+        sym = code.split(".")[1]
+        if sym == "000300":  # CSI 300 daily
+            step, noise = SCALES["d"]
+            close = _build_daily.universe(0.0, 0.6, 42, 3800.0, noise * 0.5)
+            df = pd.DataFrame({"date": days.strftime("%Y-%m-%d"), "code": code,
+                               "close": [_fmt(c) for c in close]})
+        elif frequency == "d":
+            df = daily[sym]
+        else:
+            if (sym, frequency) not in minute:
+                minute[(sym, frequency)] = _build_minute(sym, frequency, intraday_days)
+            df = minute[(sym, frequency)]
+        d = pd.to_datetime(df["date"])
+        keep = (d >= pd.Timestamp(start_date)) & (d <= pd.Timestamp(end_date))
+        return _ResultSet(df[keep][[f for f in fields.split(",") if f in df.columns]])
 
-    def fake_industry_hist_em(symbol, start_date=None, end_date=None, **_):
-        return _between(sector_daily, "日期", start_date, end_date)
+    industry_df = pd.DataFrame({
+        "updateDate": "2026-09-01", "code": [_bs_code(c) for c in UNIVERSE],
+        "code_name": [TARGET_NAME if c == TARGET_CODE else f"公司{int(c) - 300000}" for c in UNIVERSE],
+        "industry": [_industry_of(c) for c in UNIVERSE],
+        "industryClassification": "证监会行业分类"})
 
-    def fake_industry_min(symbol, period="60"):
-        return sector_hourly  # real endpoint has no date filter either
+    def query_stock_industry(code="", date=""):
+        return _ResultSet(industry_df if not code else industry_df[industry_df["code"] == code])
 
-    def fake_index_daily_em(symbol, start_date=None, end_date=None):
-        raw = _between(index_daily, "日期", start_date, end_date)
-        return pd.DataFrame({"date": raw["日期"], "open": raw["开盘"],
-                             "close": raw["收盘"], "high": raw["最高"],
-                             "low": raw["最低"], "volume": raw["成交量"],
-                             "amount": raw["成交额"]})
+    def query_stock_basic(code="", code_name=""):
+        row = industry_df[industry_df["code"] == code][["code", "code_name"]]
+        return _ResultSet(row)
 
-    def fake_index_min(symbol, period="60", start_date=None, end_date=None):
-        return _between(index_hourly, "时间", start_date, end_date)
+    def query_trade_dates(start_date=None, end_date=None):
+        cal = pd.date_range(start_date, end_date)
+        return _ResultSet(pd.DataFrame({
+            "calendar_date": cal.strftime("%Y-%m-%d"),
+            "is_trading_day": ["1" if d in days else "0" for d in cal]}))
 
-    def _flow(seed, scale):
-        rng = np.random.default_rng(seed)
-        dates = daily_cal[-120:]
+    def query_daily_history_k_AStock(date=""):
+        rows = [daily[c][daily[c]["date"] == date] for c in UNIVERSE]
+        return _ResultSet(pd.concat(rows))
+
+    published = [q for q in (datetime.now().year * 4 + (datetime.now().month - 1) // 3 - k
+                             for k in range(1, 12))]
+
+    def _quarter_ok(year, quarter):
+        return year * 4 + quarter - 1 in published
+
+    def query_profit_data(code, year=None, quarter=None):
+        if not _quarter_ok(year, quarter):
+            return _ResultSet(pd.DataFrame(columns=["code"]))
+        k = year * 4 + quarter
+        return _ResultSet(pd.DataFrame([{
+            "code": code, "pubDate": f"{year}-{quarter * 3:02d}-28",
+            "statDate": f"{year}-{quarter * 3:02d}-30",
+            "roeAvg": _fmt(0.03 * quarter + 0.001 * (k % 5)),
+            "npMargin": "0.142", "gpMargin": "0.215", "netProfit": "1.0e9",
+            "epsTTM": _fmt(1.0 + 0.05 * (k % 8)),
+            "MBRevenue": _fmt(5e9 * quarter * (1 + 0.04 * (year - 2024)), 0),
+            "totalShare": "8.6e8", "liqaShare": "8.5e8"}]))
+
+    def query_growth_data(code, year=None, quarter=None):
+        if not _quarter_ok(year, quarter):
+            return _ResultSet(pd.DataFrame(columns=["code"]))
+        return _ResultSet(pd.DataFrame([{
+            "code": code, "pubDate": "", "statDate": "", "YOYEquity": "0.1",
+            "YOYAsset": "0.12", "YOYNI": "0.35", "YOYEPSBasic": "0.3", "YOYPNI": "0.34"}]))
+
+    fake_bs = SimpleNamespace(
+        login=lambda *a, **k: SimpleNamespace(error_code="0", error_msg="success"),
+        logout=lambda *a, **k: None,
+        query_history_k_data_plus=query_history,
+        query_stock_industry=query_stock_industry,
+        query_stock_basic=query_stock_basic,
+        query_trade_dates=query_trade_dates,
+        query_profit_data=query_profit_data,
+        query_growth_data=query_growth_data,
+    )
+    if whole_market:
+        fake_bs.query_daily_history_k_AStock = query_daily_history_k_AStock
+
+    def sina_minute(symbol, period="1", adjust=""):
+        stamps = [pd.Timestamp(f"{d.date()} {t}") for d in intraday_days
+                  for t in SESSION_BARS[period]]
+        step, noise = SCALES[period]
+        close = _build_minute.universes[period](0.0, 0.6, 42, 3800.0, noise * 0.5)[-len(stamps):]
+        return pd.DataFrame({"day": [s.strftime("%Y-%m-%d %H:%M:%S") for s in stamps],
+                             "open": close, "high": close, "low": close,
+                             "close": [_fmt(c) for c in close], "volume": 1})[-1970:]
+
+    def ths_flow(symbol="即时"):
+        rng = np.random.default_rng(_seed(symbol))
+        n = len(UNIVERSE) + 1
+        codes = [int(c) for c in UNIVERSE] + [1]  # 000001 loses its zeros in read_html
         return pd.DataFrame({
-            "日期": dates.strftime("%Y-%m-%d"),
-            "主力净流入-净额": rng.normal(0, scale, len(dates)).round(0),
-            "主力净流入-净占比": rng.normal(0, 5, len(dates)).round(2),
-        })
+            "序号": range(1, n + 1), "股票代码": codes, "股票简称": "x", "最新价": 10.0,
+            "阶段涨跌幅": [f"{x:.2f}%" for x in rng.normal(0, 6, n)],
+            "连续换手率": [f"{x:.2f}%" for x in rng.uniform(2, 40, n)],
+            "资金流入净额": [_ths_amount(x) for x in rng.normal(0, 2e8, n)]})
 
-    def fake_margin_szse(date):
-        return pd.DataFrame({"证券代码": [TARGET_CODE], "证券简称": ["阳光电源"],
+    def margin_szse(date):
+        return pd.DataFrame({"证券代码": [TARGET_CODE], "证券简称": [TARGET_NAME],
                              "融资买入额": [5.2e7], "融资余额": [3.1e9],
                              "融券卖出量": [10000], "融券余量": [200000]})
 
-    def fake_fin_abstract(symbol, **_):
-        return pd.DataFrame({
-            "报告期": ["2026-06-30", "2026-03-31", "2025-12-31", "2025-09-30"],
-            "营业总收入同比增长率": ["-18.26%", "-12.0%", "35.0%", "40.0%"],
-            "净利润同比增长率": ["-40.12%", "-20.0%", "45.0%", "50.0%"],
-            "销售毛利率": ["28.5%", "29.1%", "31.0%", "30.5%"],
-            "销售净利率": ["14.7%", "15.2%", "18.0%", "17.5%"],
-            "净资产收益率": ["9.8%", "5.1%", "22.0%", "18.0%"],
-            "基本每股收益": ["1.10", "0.55", "5.20", "3.90"],
-        })
-
-    targets = {
-        "stock_zh_a_hist": fake_stock_zh_a_hist,
-        "stock_zh_a_hist_min_em": fake_stock_min,
-        "stock_individual_info_em": fake_individual_info_em,
-        "stock_zh_a_spot_em": lambda: spot_df,
-        "stock_board_industry_cons_em": fake_industry_cons_em,
-        "stock_board_industry_hist_em": fake_industry_hist_em,
-        "stock_board_industry_hist_min_em": fake_industry_min,
-        "stock_zh_index_daily_em": fake_index_daily_em,
-        "index_zh_a_hist_min_em": fake_index_min,
-        "stock_individual_fund_flow": lambda stock, market: _flow(7, 3e7),
-        "stock_sector_fund_flow_hist": lambda symbol: _flow(8, 2e8),
-        # Empty = "not a Stock-Connect name" — must not crash.
-        "stock_hsgt_individual_detail_em": lambda symbol, **_: pd.DataFrame(),
-        "stock_margin_detail_sse": lambda date: pd.DataFrame(),
-        "stock_margin_detail_szse": fake_margin_szse,
-        "stock_financial_abstract_ths": fake_fin_abstract,
-    }
-    patches = [mock.patch(f"akshare.{name}", side_effect=fn)
-               for name, fn in targets.items()]
+    patches = [
+        mock.patch.object(bsapi, "bs", fake_bs),
+        mock.patch.object(bsapi, "_logged_in", False),
+        mock.patch("akshare.stock_zh_a_minute", side_effect=sina_minute),
+        mock.patch("akshare.stock_fund_flow_individual", side_effect=ths_flow),
+        mock.patch("akshare.stock_margin_detail_sse", side_effect=lambda date: pd.DataFrame()),
+        mock.patch("akshare.stock_margin_detail_szse", side_effect=margin_szse),
+    ]
     for p in patches:
         p.start()
 
@@ -260,90 +297,117 @@ def install_mocks():
     return stop
 
 
-def _print_report(result):
-    print(f"\n{'=' * 72}\n{result.code}  {result.name}  [{result.freq}]  "
-          f"{result.start} → {result.end}  ({len(result.prices)} bars, "
-          f"MA{result.short_ma}/MA{result.long_ma})")
-    print(f"Composite score: {result.composite_score:.1f}  ->  {result.stance}")
-    for cat, (score, _detail) in result.breakdown.items():
-        print(f"  {cat:15s} {score:.1f}" if score == score else f"  {cat:15s} n/a")
-    net = result.linkage.get("leadlag_network")
+def _print_report(r):
+    print(f"\n{'=' * 76}\n{r.code} {r.name} [{r.freq}] {r.start} → {r.end}  "
+          f"{len(r.prices)} bars  MA{r.short_ma}/MA{r.long_ma}  cross-section: {r.cross_section}")
+    print(f"Composite {r.composite_score:.1f} -> {r.stance}   " + "  ".join(
+        f"{c}={s:.0f}" if s == s else f"{c}=n/a" for c, (s, _) in r.breakdown.items()))
+    net = r.linkage.get("leadlag_network")
     if net is not None and not net.empty:
-        cols = [c for c in ("lead_hours", "lead_days", "lag_corr", "threshold", "linked") if c in net]
-        print("Lead-lag network (positive = peer leads this stock):")
-        print(net[cols].sort_values(cols[0], ascending=False).round(2).to_string())
-    for w in result.warnings:
+        print(f"  linked {r.linkage.get('n_linked_peers')}/{len(net)}, leaders "
+              f"{r.linkage.get('n_leading_peers', 0)}, signal "
+              f"{r.linkage.get('leading_peer_signal_pct', float('nan')):+.2f}%")
+    for w in r.warnings:
         print(f"  ! {w}")
 
 
-def run():
-    stop = install_mocks()
+def _run(freq, days, short, long, whole_market=True):
+    from quant import cache, report
+    stop = install_mocks(whole_market=whole_market)
     try:
-        from quant import cache, report
         cache.clear()
-        full = report.build_report(f"{TARGET_CODE}.SZ")
-        narrow_daily = report.build_report(f"{TARGET_CODE}.SZ", lookback_days=61,
-                                           short_ma=5, long_ma=20, freq="daily")
-        narrow_hourly = report.build_report(f"{TARGET_CODE}.SZ", lookback_days=61,
-                                            short_ma=20, long_ma=60, freq="60m")
+        return report.build_report(f"{TARGET_CODE}.SZ", lookback_days=days,
+                                   short_ma=short, long_ma=long, freq=freq)
     finally:
         stop()
+        cache.clear()
 
-    for r in (full, narrow_daily, narrow_hourly):
+
+def run():
+    from quant import data
+
+    # Unit checks on parsing that every scenario relies on.
+    assert data.parse_cn_number("1.23亿") == 1.23e8
+    assert data.parse_cn_number("-4567.8万") == -4.5678e7
+    assert data.parse_cn_number("12.3%") == 12.3
+    assert data.parse_cn_number("--") != data.parse_cn_number("--")  # NaN
+
+    full = _run("daily", 548, 20, 60)
+    narrow = {f: _run(f, 61, *((5, 20) if f == "daily" else (20, 60)))
+              for f in ("daily", "60m", "30m", "15m")}
+    fallback = _run("daily", 61, 5, 20, whole_market=False)
+
+    for r in [full, *narrow.values(), fallback]:
         _print_report(r)
 
-    # --- Full daily report ------------------------------------------------
+    # --- Full daily -------------------------------------------------------
     r = full
-    assert r.composite_score == r.composite_score and 0 <= r.composite_score <= 100
-    for key in ("industry_beta", "market_beta", "ret_today_pctile_industry",
+    assert 0 <= r.composite_score <= 100
+    assert r.cross_section.startswith("whole market")
+    for key in ("market_beta", "industry_beta", "ret_60d_pctile_market",
+                "ret_60d_pctile_industry", "value_rank_market", "value_rank_industry",
                 "peer_avg_corr"):
-        assert key in r.linkage, f"full: missing {key}"
-    assert "sde_drift_diffusion_ratio" in r.technical
-    assert r.technical.get("ret_12m") == r.technical.get("ret_12m"), \
-        "full: 12m return should exist on ~18 months of data"
-    net = r.linkage.get("leadlag_network")
-    assert net is not None and not net.empty, "full: lead-lag network empty"
-    assert r.linkage.get("n_leading_peers", 0) > 0, "full: no leading peers found"
-    # Every synthetic peer here is sector-loaded with |lead| <= 3 bars, so on
-    # ~6 months of daily bars most should be detected, and their lags read
-    # close to the truth.
+        assert r.linkage.get(key) == r.linkage.get(key), f"full: {key} missing"
+    assert r.technical.get("ret_12m") == r.technical.get("ret_12m"), "full: ret_12m missing"
+    cf = r.capital_flow
+    assert set(r.flow_values) == {"3d", "5d", "10d", "20d"}, r.flow_values
+    assert len(set(r.flow_values.values())) == 4, \
+        f"each THS horizon should be read from its own table: {r.flow_values}"
+    for key in ("inflow_5d_pctile_industry", "inflow_5d_pctile_market", "bar_direction_flow"):
+        assert cf.get(key) == cf.get(key), f"full: {key} missing"
+    assert cf.get("inflow_scaled_by_turnover") is True
+    assert cf.get("margin_balance") == 3.1e9
+    fin = r.financials
+    assert not fin.empty and fin["roe"].between(3, 30).all(), \
+        f"ROE should be annualized percent: {fin['roe'].tolist()}"
+    assert fin["net_profit_yoy"].iloc[0] == 35.0
+    assert fin["revenue_yoy"].notna().any(), "revenue YoY never computed"
+    net = r.linkage["leadlag_network"]
     linked = net[net["linked"].astype(bool)]
-    assert len(linked) >= len(net) * 0.6, f"full: only {len(linked)}/{len(net)} peers linked"
-    true = {label: _true_lead(label) for label in linked.index}
-    err = np.abs(linked["lead_days"] - pd.Series(true))
-    assert (err <= 1.0).mean() >= 0.75, f"full: lag recovery too poor: {err.round(2).to_dict()}"
+    assert len(linked) >= len(net) * 0.6, f"full: only {len(linked)}/{len(net)} linked"
+    err = (linked["lead_days"] - pd.Series({k: _true_lead(k) for k in linked.index})).abs()
+    assert (err <= 1.0).mean() >= 0.75, f"full: lag recovery too poor {err.round(2).to_dict()}"
+    assert all(TARGET_CODE not in label for label in net.index), "target in its own peer set"
 
     # --- Two-month daily --------------------------------------------------
-    r = narrow_daily
-    assert 35 <= len(r.prices) <= 46, f"narrow daily: {len(r.prices)} bars"
-    assert r.technical, "narrow daily: technical category empty"
-    t = r.technical
+    r = narrow["daily"]
+    assert 35 <= len(r.prices) <= 46, f"2m daily: {len(r.prices)} bars"
     for key in ("ret_12m", "ret_6m", "ret_3m", "momentum_12_1", "hi_52w"):
-        assert t.get(key) != t.get(key), \
-            f"narrow daily: {key} must be NaN on two months, got {t.get(key)}"
-    assert t.get("ret_window") == t.get("ret_window"), "narrow daily: window return missing"
-    assert len(r.fund_flow) <= 46, "narrow daily: fund flow not trimmed to window"
+        v = r.technical.get(key)
+        assert v != v, f"2m daily: {key} must be NaN, got {v}"
 
-    # --- Two-month hourly -------------------------------------------------
-    r = narrow_hourly
-    assert r.bar_unit == "hour" and r.bars_per_day == 4
-    assert 140 <= len(r.prices) <= 184, f"narrow hourly: {len(r.prices)} bars"
-    assert r.technical, "narrow hourly: technical category empty"
-    assert "market_beta" in r.linkage, "narrow hourly: no market beta from index minute bars"
-    assert "industry_beta" in r.linkage, "narrow hourly: no industry beta from board minute bars"
-    net = r.linkage.get("leadlag_network")
-    assert net is not None and not net.empty, "narrow hourly: lead-lag network empty"
-    assert {"lead_hours", "lead_days", "lead_bars"} <= set(net.columns)
-    assert np.allclose(net["lead_days"] * 4, net["lead_hours"]), \
-        "narrow hourly: hours/days conversion inconsistent"
-    assert r.linkage.get("n_linked_peers", 0) > 0, "narrow hourly: no peers linked"
-    # Hourly vol must be annualized on 4 bars/day, not as if each bar were a day.
-    daily_vol = narrow_daily.technical["sde_diffusion_annual"]
-    hourly_vol = r.technical["sde_diffusion_annual"]
-    assert 0.2 < hourly_vol / daily_vol < 5, \
-        f"hourly vs daily annualized diffusion out of line: {hourly_vol:.3f} vs {daily_vol:.3f}"
+    # --- Two-month intraday -----------------------------------------------
+    daily_sigma = narrow["daily"].technical["sde_diffusion_annual"]
+    for freq, per_day in (("60m", 4), ("30m", 8), ("15m", 16)):
+        r = narrow[freq]
+        assert r.bars_per_day == per_day and r.bar_minutes == int(freq[:-1])
+        n = len(r.prices)
+        assert 40 * per_day <= n <= 46 * per_day, f"{freq}: {n} bars"
+        assert r.prices["date"].dt.time.astype(str).isin(
+            [t + ":00" for t in SESSION_BARS[freq[:-1]]]).all(), f"{freq}: bad bar times"
+        assert r.technical, f"{freq}: technical empty"
+        assert "market_beta" in r.linkage, f"{freq}: no market beta (Sina index bars)"
+        assert "industry_beta" in r.linkage, f"{freq}: no industry beta (peer composite)"
+        net = r.linkage.get("leadlag_network")
+        assert net is not None and not net.empty, f"{freq}: lead-lag network empty"
+        assert np.allclose(net["lead_hours"], net["lead_bars"] * int(freq[:-1]) / 60)
+        assert np.allclose(net["lead_days"], net["lead_bars"] / per_day)
+        assert r.linkage.get("n_linked_peers", 0) >= len(net) * 0.5, \
+            f"{freq}: only {r.linkage.get('n_linked_peers')}/{len(net)} linked"
+        ratio = r.technical["sde_diffusion_annual"] / daily_sigma
+        assert 0.2 < ratio < 5, f"{freq}: annualized diffusion off vs daily ({ratio:.2f}x)"
 
-    print("\nSelf-test passed (full daily, two-month daily, two-month hourly).")
+    # --- Whole-market query unavailable -------------------------------------
+    r = fallback
+    assert r.cross_section == "peer sample"
+    assert any("Whole-market snapshot unavailable" in w for w in r.warnings)
+    assert r.linkage.get("ret_60d_pctile_market") is None
+    assert r.linkage.get("value_rank_industry") == r.linkage.get("value_rank_industry"), \
+        "fallback: industry value rank should come from the peer sample"
+    assert len(r.industry_peers) <= 13
+
+    print("\nSelf-test passed: full daily; two-month daily/60m/30m/15m; "
+          "peer-sample fallback.")
 
 
 if __name__ == "__main__":
