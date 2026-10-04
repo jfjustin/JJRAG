@@ -18,13 +18,3 @@ openai>=1.30
 
 # Local generation (Privacy mode) is served by Ollama (https://ollama.com),
 # installed separately as a system binary — not a Python package.
-
-# Quant dashboard (quant/, dashboard.py) — free market data, no account or
-# credentials: BaoStock is the primary source; AKShare is used only for its
-# Sina (index minute bars), 同花顺 (money flow) and SSE/SZSE (margin) fetchers
-baostock>=0.9.4  # whole-market per-date query; older releases fall back to a peer sample
-akshare>=1.18
-pandas>=2.0
-numpy>=1.24
-scipy>=1.10
-plotly>=5.20
